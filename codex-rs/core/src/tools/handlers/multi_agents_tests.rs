@@ -106,6 +106,20 @@ fn thread_manager() -> ThreadManager {
     )
 }
 
+async fn install_agent_control_with_root(
+    session: &mut crate::session::session::Session,
+    turn: &TurnContext,
+) -> ThreadManager {
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    manager
+}
+
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
     let role_name = "fork-context-role".to_string();
     tokio::fs::create_dir_all(&turn.config.codex_home)
@@ -1511,7 +1525,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_spawn_preview() {
+async fn multi_agent_v2_completed_resident_is_listed_but_does_not_keep_wait_agent_open() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -1568,8 +1582,8 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
 
     let output = ListAgentsHandlerV2
         .handle(invocation(
-            session,
-            turn,
+            session.clone(),
+            turn.clone(),
             "list_agents",
             function_payload(json!({})),
         ))
@@ -1599,6 +1613,32 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
     assert_eq!(worker.last_task_message, None);
     assert_eq!(success, Some(true));
+
+    let _ = session.input_queue.drain_mailbox_input_items().await;
+
+    let output = timeout(
+        Duration::from_millis(500),
+        WaitAgentHandlerV2::default().handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({"timeout_ms": 10_000})),
+        )),
+    )
+    .await
+    .expect("completed resident should not keep wait_agent open")
+    .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "No agents are currently running.".to_string(),
+            timed_out: false,
+        }
+    );
+    assert_eq!(success, None);
 }
 
 #[tokio::test]
@@ -3088,7 +3128,7 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_below_configured_min() {
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -3098,6 +3138,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
     config.multi_agent_v2.max_wait_timeout_ms = 1_000;
     config.multi_agent_v2.default_wait_timeout_ms = 50;
     set_turn_config(&mut turn, config);
+    let _manager = install_agent_control_with_root(&mut session, &turn).await;
 
     let output = WaitAgentHandlerV2::default()
         .handle(invocation(
@@ -3114,8 +3155,8 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
+            message: "No agents are currently running.".to_string(),
+            timed_out: false,
         }
     );
     assert_eq!(success, None);
@@ -3123,7 +3164,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -3133,8 +3174,22 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
     config.multi_agent_v2.max_wait_timeout_ms = 1_000;
     config.multi_agent_v2.default_wait_timeout_ms = 50;
     set_turn_config(&mut turn, config);
+    let _manager = install_agent_control_with_root(&mut session, &turn).await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
 
     let early = timeout(
         Duration::from_millis(/*millis*/ 20),
@@ -3178,7 +3233,7 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -3188,6 +3243,7 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
     config.multi_agent_v2.max_wait_timeout_ms = 0;
     config.multi_agent_v2.default_wait_timeout_ms = 0;
     set_turn_config(&mut turn, config);
+    let _manager = install_agent_control_with_root(&mut session, &turn).await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
@@ -3209,8 +3265,8 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
+            message: "No agents are currently running.".to_string(),
+            timed_out: false,
         }
     );
     assert_eq!(success, None);
@@ -3248,7 +3304,7 @@ async fn multi_agent_v2_wait_agent_rejects_timeout_above_configured_max() {
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() {
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -3258,6 +3314,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
     config.multi_agent_v2.max_wait_timeout_ms = 1;
     config.multi_agent_v2.default_wait_timeout_ms = 1;
     set_turn_config(&mut turn, config);
+    let _manager = install_agent_control_with_root(&mut session, &turn).await;
 
     let output = WaitAgentHandlerV2::default()
         .handle(invocation(
@@ -3274,8 +3331,8 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait timed out.".to_string(),
-            timed_out: true,
+            message: "No agents are currently running.".to_string(),
+            timed_out: false,
         }
     );
     assert_eq!(success, None);

@@ -152,7 +152,7 @@ impl AgentRegistry {
             .cloned()
     }
 
-    pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {
+    pub(crate) fn resident_agents(&self) -> Vec<AgentMetadata> {
         self.active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

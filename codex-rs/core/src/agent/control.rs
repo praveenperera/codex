@@ -358,22 +358,30 @@ impl AgentControl {
         &self,
         parent_thread_id: ThreadId,
     ) -> String {
+        let Ok(state) = self.upgrade() else {
+            return String::new();
+        };
         let Ok(agents) = self.open_thread_spawn_children(parent_thread_id).await else {
             return String::new();
         };
 
-        agents
-            .into_iter()
-            .map(|(thread_id, metadata)| {
-                let reference = metadata
-                    .agent_path
-                    .as_ref()
-                    .map(|agent_path| agent_path.name().to_string())
-                    .unwrap_or_else(|| thread_id.to_string());
-                format_subagent_context_line(reference.as_str(), metadata.agent_nickname.as_deref())
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut lines = Vec::with_capacity(agents.len());
+        for (thread_id, metadata) in agents {
+            let Ok(thread) = state.get_thread(thread_id).await else {
+                continue;
+            };
+            let reference = metadata
+                .agent_path
+                .as_ref()
+                .map(|agent_path| agent_path.name().to_string())
+                .unwrap_or_else(|| thread_id.to_string());
+            lines.push(format_subagent_context_line(
+                reference.as_str(),
+                metadata.agent_nickname.as_deref(),
+                &thread.agent_status().await,
+            ));
+        }
+        lines.join("\n")
     }
 
     pub(crate) async fn list_agents(
@@ -392,8 +400,8 @@ impl AgentControl {
             })
             .transpose()?;
 
-        let mut live_agents = self.state.live_agents();
-        live_agents.sort_by(|left, right| {
+        let mut resident_agents = self.state.resident_agents();
+        resident_agents.sort_by(|left, right| {
             left.agent_path
                 .as_deref()
                 .unwrap_or_default()
@@ -407,7 +415,7 @@ impl AgentControl {
         });
 
         let root_path = AgentPath::root();
-        let mut agents = Vec::with_capacity(live_agents.len().saturating_add(1));
+        let mut agents = Vec::with_capacity(resident_agents.len().saturating_add(1));
         if resolved_prefix
             .as_ref()
             .is_none_or(|prefix| agent_matches_prefix(Some(&root_path), prefix))
@@ -421,7 +429,7 @@ impl AgentControl {
             });
         }
 
-        for metadata in live_agents {
+        for metadata in resident_agents {
             let Some(thread_id) = metadata.agent_id else {
                 continue;
             };

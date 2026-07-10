@@ -389,7 +389,7 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         properties
             .get("path_prefix")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Task-path prefix filter without a trailing slash. Omit to list all live agents.")
+        Some("Task-path prefix filter without a trailing slash. Omit to list all resident agents.")
     );
     assert_eq!(
         output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],

@@ -252,7 +252,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline."
+        description: "Wait for a mailbox update from another pending or running agent, including queued messages and final-status notifications. Returns immediately when no other agent is pending or running. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, a no-running-agents summary, or a timeout summary if no activity arrives before the deadline."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -265,7 +265,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "path_prefix".to_string(),
         JsonSchema::string(Some(
-            "Task-path prefix filter without a trailing slash. Omit to list all live agents."
+            "Task-path prefix filter without a trailing slash. Omit to list all resident agents."
                 .to_string(),
         )),
     )]);
@@ -273,7 +273,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
         description:
-            "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+            "List resident agents in the current root thread tree, including completed agents that can receive follow-up tasks. Optionally filter by task-path prefix."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -444,7 +444,7 @@ fn list_agents_output_schema() -> Value {
                     "required": ["agent_name", "agent_status", "last_task_message"],
                     "additionalProperties": false
                 },
-                "description": "Live agents visible in the current root thread tree."
+                "description": "Resident agents visible in the current root thread tree."
             }
         },
         "required": ["agents"],

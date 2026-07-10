@@ -73,6 +73,25 @@ impl Handler {
             .input_queue
             .subscribe_activity(turn_state.as_deref())
             .await;
+        let current_agent_name = turn
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(AgentPath::root)
+            .to_string();
+        let has_running_agent = session
+            .services
+            .agent_control
+            .list_agents(&turn.session_source, None)
+            .await
+            .map_err(collab_spawn_error)?
+            .into_iter()
+            .any(|agent| {
+                agent.agent_name != current_agent_name
+                    && matches!(
+                        agent.agent_status,
+                        AgentStatus::PendingInit | AgentStatus::Running
+                    )
+            });
 
         session
             .emit_turn_item_started(
@@ -93,7 +112,13 @@ impl Handler {
             .await;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
+        let outcome = wait_for_activity(
+            &mut activity_rx,
+            pending_activity,
+            has_running_agent,
+            deadline,
+        )
+        .await;
         let result = WaitAgentResult::from_outcome(outcome);
 
         session
@@ -141,6 +166,7 @@ impl WaitAgentResult {
         let message = match outcome {
             WaitOutcome::MailboxActivity => "Wait completed.",
             WaitOutcome::Steered => "Wait interrupted by new input.",
+            WaitOutcome::NoRunningAgents => "No agents are currently running.",
             WaitOutcome::TimedOut => "Wait timed out.",
         };
         Self {
@@ -172,12 +198,14 @@ impl ToolOutput for WaitAgentResult {
 enum WaitOutcome {
     MailboxActivity,
     Steered,
+    NoRunningAgents,
     TimedOut,
 }
 
 async fn wait_for_activity(
     activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
     pending_activity: Option<InputQueueActivity>,
+    has_running_agent: bool,
     deadline: Instant,
 ) -> WaitOutcome {
     if let Some(activity) = pending_activity {
@@ -185,6 +213,15 @@ async fn wait_for_activity(
             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
             InputQueueActivity::Steer => WaitOutcome::Steered,
         };
+    }
+    if !has_running_agent {
+        if activity_rx.has_changed().unwrap_or(false) {
+            return match *activity_rx.borrow_and_update() {
+                InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
+                InputQueueActivity::Steer => WaitOutcome::Steered,
+            };
+        }
+        return WaitOutcome::NoRunningAgents;
     }
     match timeout_at(deadline, activity_rx.changed()).await {
         Ok(Ok(())) => match *activity_rx.borrow_and_update() {
