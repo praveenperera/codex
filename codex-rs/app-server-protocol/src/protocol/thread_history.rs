@@ -969,6 +969,8 @@ impl ThreadHistoryBuilder {
             kind: payload.kind.into(),
             agent_thread_id: payload.agent_thread_id.to_string(),
             agent_path: String::from(payload.agent_path.clone()),
+            model: payload.model.clone(),
+            reasoning_effort: payload.reasoning_effort.clone(),
         });
     }
 
@@ -3788,6 +3790,51 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_sub_agent_started_activity_with_model_metadata() {
+        let agent_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid agent thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
+                message: "spawn agent".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            }),
+            EventMsg::SubAgentActivity(codex_protocol::protocol::SubAgentActivityEvent {
+                event_id: "spawn-activity-1".into(),
+                occurred_at_ms: 0,
+                agent_thread_id,
+                agent_path: codex_protocol::AgentPath::try_from("/root/verify_mobile")
+                    .expect("valid agent path"),
+                kind: codex_protocol::protocol::SubAgentActivityKind::Started,
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::SubAgentActivity {
+                id: "spawn-activity-1".into(),
+                kind: crate::protocol::v2::SubAgentActivityKind::Started,
+                agent_thread_id: agent_thread_id.to_string(),
+                agent_path: "/root/verify_mobile".into(),
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium,),
             }
         );
     }

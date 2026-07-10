@@ -12,7 +12,10 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
@@ -352,6 +355,22 @@ async fn wait_for_requests(
         }
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn spawned_activity_from_rollout(test: &TestCodex) -> Result<SubAgentActivityEvent> {
+    let rollout_path = test
+        .codex
+        .rollout_path()
+        .ok_or_else(|| anyhow::anyhow!("expected parent rollout path"))?;
+    let rollout = tokio::fs::read_to_string(rollout_path).await?;
+    rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .find_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::SubAgentActivity(activity)) => Some(activity),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("spawn should emit a sub-agent activity item"))
 }
 
 async fn setup_turn_one_with_spawned_child(
@@ -1071,7 +1090,7 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
             ev_response_created("resp-turn1-1"),
             ev_function_call_with_namespace(
                 SPAWN_CALL_ID,
-                MULTI_AGENT_V1_NAMESPACE,
+                MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
                 &spawn_args,
             ),
@@ -1112,6 +1131,9 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
             .features
             .enable(Feature::MultiAgentV2)
             .expect("test config should allow feature update");
+        config.model = Some(INHERITED_MODEL.to_string());
+        config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
+        config.multi_agent_v2.hide_spawn_agent_metadata = false;
         config.developer_instructions = Some("Parent developer instructions.".to_string());
     });
     let test = builder.build(&server).await?;
@@ -1124,6 +1146,19 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
         .expect("child request log should capture at least one request");
     assert!(child_request.body_contains_text("Parent developer instructions."));
     assert!(child_request.body_contains_text(CHILD_PROMPT));
+
+    let activity = spawned_activity_from_rollout(&test).await?;
+    let child_snapshot = test
+        .thread_manager
+        .get_thread(activity.agent_thread_id)
+        .await?
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        activity.model.as_deref(),
+        Some(child_snapshot.model.as_str())
+    );
+    assert_eq!(activity.reasoning_effort, child_snapshot.reasoning_effort);
 
     Ok(())
 }
@@ -1230,6 +1265,9 @@ async fn encrypted_multi_agent_v2_spawn_sends_agent_message_to_child() -> Result
             ],
         })])
     );
+    let activity = spawned_activity_from_rollout(&test).await?;
+    assert_eq!(activity.model, None);
+    assert_eq!(activity.reasoning_effort, None);
 
     let child_thread_id = test
         .thread_manager

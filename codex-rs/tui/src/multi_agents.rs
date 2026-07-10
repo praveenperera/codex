@@ -297,13 +297,22 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
 
 pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
     let ThreadItem::SubAgentActivity {
-        kind, agent_path, ..
+        kind,
+        agent_path,
+        model,
+        reasoning_effort,
+        ..
     } = item
     else {
         return None;
     };
     Some(collab_event(
-        sub_agent_activity_title(*kind, agent_path),
+        sub_agent_activity_title(
+            *kind,
+            agent_path,
+            model.as_deref(),
+            reasoning_effort.as_ref(),
+        ),
         Vec::new(),
     ))
 }
@@ -316,16 +325,25 @@ pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path:
     }
 }
 
-fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
+fn sub_agent_activity_title(
+    kind: SubAgentActivityKind,
+    agent_path: &str,
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffortConfig>,
+) -> Line<'static> {
     let (prefix, path) = match kind {
         SubAgentActivityKind::Started => ("Started ", agent_path),
         SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
         SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
     };
-    title_spans_line(vec![
+    let mut spans = vec![
         Span::from(prefix).bold(),
         Span::from(format!("`{path}`")).cyan(),
-    ])
+    ];
+    if matches!(kind, SubAgentActivityKind::Started) {
+        spans.extend(model_reasoning_effort_spans(model, reasoning_effort));
+    }
+    title_spans_line(spans)
 }
 
 fn spawn_end(
@@ -528,15 +546,28 @@ fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<
         return Vec::new();
     };
 
-    let model = spawn_request.model.trim();
-    if model.is_empty() && spawn_request.reasoning_effort == ReasoningEffortConfig::default() {
+    model_reasoning_effort_spans(
+        Some(&spawn_request.model),
+        Some(&spawn_request.reasoning_effort),
+    )
+}
+
+fn model_reasoning_effort_spans(
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffortConfig>,
+) -> Vec<Span<'static>> {
+    let model = model.map(str::trim).filter(|model| !model.is_empty());
+    if model.is_none()
+        && reasoning_effort.is_none_or(|effort| *effort == ReasoningEffortConfig::default())
+    {
         return Vec::new();
     }
 
-    let details = if model.is_empty() {
-        format!("({})", spawn_request.reasoning_effort)
-    } else {
-        format!("({model} {})", spawn_request.reasoning_effort)
+    let details = match (model, reasoning_effort) {
+        (Some(model), Some(reasoning_effort)) => format!("({model} {reasoning_effort})"),
+        (Some(model), None) => format!("({model})"),
+        (None, Some(reasoning_effort)) => format!("({reasoning_effort})"),
+        (None, None) => return Vec::new(),
     };
 
     vec![Span::from(" ").dim(), Span::from(details).magenta()]
@@ -792,6 +823,48 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         assert_snapshot!("collab_agent_transcript", snapshot);
+    }
+
+    #[test]
+    fn sub_agent_activity_snapshot() {
+        let thread_id = "00000000-0000-0000-0000-000000000002".to_string();
+        let activities = [
+            ThreadItem::SubAgentActivity {
+                id: "call-spawn".to_string(),
+                kind: SubAgentActivityKind::Started,
+                agent_thread_id: thread_id.clone(),
+                agent_path: "/root/verify_mobile".to_string(),
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::Medium),
+            },
+            ThreadItem::SubAgentActivity {
+                id: "call-message".to_string(),
+                kind: SubAgentActivityKind::Interacted,
+                agent_thread_id: thread_id.clone(),
+                agent_path: "/root/verify_mobile".to_string(),
+                model: None,
+                reasoning_effort: None,
+            },
+            ThreadItem::SubAgentActivity {
+                id: "call-interrupt".to_string(),
+                kind: SubAgentActivityKind::Interrupted,
+                agent_thread_id: thread_id,
+                agent_path: "/root/verify_mobile".to_string(),
+                model: None,
+                reasoning_effort: None,
+            },
+        ];
+
+        let snapshot = activities
+            .iter()
+            .map(|activity| {
+                let cell =
+                    sub_agent_activity_history_cell(activity).expect("sub-agent activity renders");
+                cell_to_text(&cell)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_snapshot!("sub_agent_activity", snapshot);
     }
 
     #[cfg(target_os = "macos")]

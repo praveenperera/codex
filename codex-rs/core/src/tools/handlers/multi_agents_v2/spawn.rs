@@ -139,6 +139,19 @@ async fn handle_spawn_agent(
         .as_ref()
         .and_then(|snapshot| snapshot.session_source.get_nickname())
         .or(spawned_agent.metadata.agent_nickname);
+    let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
+    let (model, reasoning_effort) = if hide_agent_metadata {
+        (None, None)
+    } else {
+        (
+            agent_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.model.clone()),
+            agent_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.reasoning_effort.clone()),
+        )
+    };
     emit_sub_agent_activity(
         &session,
         &turn,
@@ -147,6 +160,8 @@ async fn handle_spawn_agent(
             agent_thread_id: new_thread_id,
             agent_path: new_agent_path.clone(),
             kind: SubAgentActivityKind::Started,
+            model,
+            reasoning_effort,
         },
     )
     .await;
@@ -158,7 +173,6 @@ async fn handle_spawn_agent(
     );
     let task_name = String::from(new_agent_path);
 
-    let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
         Ok(SpawnAgentResult::HiddenMetadata { task_name })
     } else {

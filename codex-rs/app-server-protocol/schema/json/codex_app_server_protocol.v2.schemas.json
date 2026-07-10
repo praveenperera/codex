@@ -16287,6 +16287,22 @@
             "kind": {
               "$ref": "#/definitions/SubAgentActivityKind"
             },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasoningEffort": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "enum": [
                 "subAgentActivity"
