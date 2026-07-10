@@ -5,6 +5,7 @@ use codex_utils_output_truncation::approx_token_count;
 use super::COMPLETION_MESSAGE_MAX_TOKENS;
 use super::ERROR_NEXT_ACTION;
 use super::format_inter_agent_completion_message;
+use super::format_subagent_context_line;
 
 #[test]
 fn error_completion_message_stays_below_manual_review_threshold() {
@@ -17,4 +18,18 @@ fn error_completion_message_stays_below_manual_review_threshold() {
 
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
     assert!(message.contains(ERROR_NEXT_ACTION));
+}
+
+#[test]
+fn subagent_context_identifies_completed_residents_without_exposing_their_output() {
+    let line = format_subagent_context_line(
+        "trace_subagent_activity",
+        Some("Heisenberg"),
+        &AgentStatus::Completed(Some("private final output".to_string())),
+    );
+
+    assert_eq!(
+        line,
+        "- trace_subagent_activity: Heisenberg (status: completed)"
+    );
 }

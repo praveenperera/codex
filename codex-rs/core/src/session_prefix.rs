@@ -50,9 +50,20 @@ mod tests;
 pub(crate) fn format_subagent_context_line(
     agent_reference: &str,
     agent_nickname: Option<&str>,
+    status: &AgentStatus,
 ) -> String {
-    match agent_nickname.filter(|nickname| !nickname.is_empty()) {
+    let agent = match agent_nickname.filter(|nickname| !nickname.is_empty()) {
         Some(agent_nickname) => format!("- {agent_reference}: {agent_nickname}"),
         None => format!("- {agent_reference}"),
-    }
+    };
+    let status = match status {
+        AgentStatus::PendingInit => "pending",
+        AgentStatus::Running => "running",
+        AgentStatus::Interrupted => "interrupted",
+        AgentStatus::Completed(_) => "completed",
+        AgentStatus::Errored(_) => "errored",
+        AgentStatus::Shutdown => "shutdown",
+        AgentStatus::NotFound => "not found",
+    };
+    format!("{agent} (status: {status})")
 }
