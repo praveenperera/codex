@@ -84,6 +84,7 @@ pub(crate) enum ExecCommandOnExit {
 
 const DEFAULT_WATCHDOG_GRACE_PERIOD_MS: u64 = 5_000;
 const MAX_WATCHDOG_GRACE_PERIOD_MS: u64 = 30_000;
+const MAX_WATCHDOG_TIMEOUT_MS: u64 = i64::MAX as u64 / 1_000_000;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +109,11 @@ where
     let timeout_ms = <u64 as serde::Deserialize>::deserialize(deserializer)?;
     if timeout_ms == 0 {
         return Err(serde::de::Error::custom("timeout_ms must be positive"));
+    }
+    if timeout_ms > MAX_WATCHDOG_TIMEOUT_MS {
+        return Err(serde::de::Error::custom(format!(
+            "timeout_ms must be between 1 and {MAX_WATCHDOG_TIMEOUT_MS}"
+        )));
     }
     Ok(timeout_ms)
 }
@@ -259,3 +265,6 @@ mod process_tests;
 #[cfg(unix)]
 #[path = "mod_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "watchdog_tests.rs"]
+mod watchdog_tests;

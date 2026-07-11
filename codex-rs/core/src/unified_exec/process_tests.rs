@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 
 struct MockExecProcess {
@@ -26,6 +27,9 @@ struct MockExecProcess {
     wake_tx: watch::Sender<u64>,
     signal_count: AtomicUsize,
     terminate_count: AtomicUsize,
+    signal_blocker: Option<Arc<Notify>>,
+    terminate_blocker: Option<Arc<Notify>>,
+    terminate_started: Notify,
 }
 
 impl MockExecProcess {
@@ -48,6 +52,10 @@ impl MockExecProcess {
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
         self.terminate_count.fetch_add(1, Ordering::SeqCst);
+        self.terminate_started.notify_one();
+        if let Some(blocker) = &self.terminate_blocker {
+            blocker.notified().await;
+        }
         if let Some(message) = &self.terminate_error {
             return Err(ExecServerError::Protocol(message.clone()));
         }
@@ -83,7 +91,12 @@ impl ExecProcess for MockExecProcess {
 
     fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
         self.signal_count.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            if let Some(blocker) = &self.signal_blocker {
+                blocker.notified().await;
+            }
+            Ok(())
+        })
     }
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
@@ -104,6 +117,21 @@ async fn remote_process_with_handle(
     write_status: WriteStatus,
     terminate_error: Option<String>,
 ) -> (UnifiedExecProcess, Arc<MockExecProcess>) {
+    remote_process_with_blockers(
+        write_status,
+        terminate_error,
+        /*signal_blocker*/ None,
+        /*terminate_blocker*/ None,
+    )
+    .await
+}
+
+async fn remote_process_with_blockers(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+    signal_blocker: Option<Arc<Notify>>,
+    terminate_blocker: Option<Arc<Notify>>,
+) -> (UnifiedExecProcess, Arc<MockExecProcess>) {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let process = Arc::new(MockExecProcess {
         process_id: "test-process".to_string().into(),
@@ -115,6 +143,9 @@ async fn remote_process_with_handle(
         wake_tx,
         signal_count: AtomicUsize::new(0),
         terminate_count: AtomicUsize::new(0),
+        signal_blocker,
+        terminate_blocker,
+        terminate_started: Notify::new(),
     });
     let started = StartedExecProcess {
         process: process.clone(),
@@ -172,6 +203,98 @@ async fn watchdog_interrupts_before_hard_termination_after_grace_period() {
 
     assert_eq!(handle.signal_count.load(Ordering::SeqCst), 1);
     assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn watchdog_grace_bounds_stalled_remote_interrupt() {
+    let signal_blocker = Arc::new(Notify::new());
+    let (process, handle) = remote_process_with_blockers(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(signal_blocker),
+        /*terminate_blocker*/ None,
+    )
+    .await;
+    let process = Arc::new(process);
+
+    process.start_watchdog(Some(crate::unified_exec::ExecCommandWatchdog {
+        timeout_ms: 1,
+        grace_period_ms: 10,
+    }));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        process.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("stalled interrupt should not prevent hard termination");
+
+    assert_eq!(handle.signal_count.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn watchdog_observes_remote_termination_before_reporting_completion() {
+    let terminate_blocker = Arc::new(Notify::new());
+    let (process, handle) = remote_process_with_blockers(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        /*signal_blocker*/ None,
+        Some(Arc::clone(&terminate_blocker)),
+    )
+    .await;
+    let process = Arc::new(process);
+
+    process.start_watchdog(Some(crate::unified_exec::ExecCommandWatchdog {
+        timeout_ms: 1,
+        grace_period_ms: 0,
+    }));
+    handle.terminate_started.notified().await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            process.cancellation_token().cancelled(),
+        )
+        .await
+        .is_err()
+    );
+
+    terminate_blocker.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        process.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("completion should be released after remote termination finishes");
+    assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn watchdog_bounds_stalled_remote_termination() {
+    let (process, handle) = remote_process_with_blockers(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        /*signal_blocker*/ None,
+        Some(Arc::new(Notify::new())),
+    )
+    .await;
+    let process = Arc::new(process);
+
+    process.start_watchdog(Some(crate::unified_exec::ExecCommandWatchdog {
+        timeout_ms: 1,
+        grace_period_ms: 0,
+    }));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        process.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("stalled termination should be bounded");
+
+    assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        process.termination_reason(),
+        Some(crate::unified_exec::ExecCommandTerminationReason::TimedOut)
+    );
 }
 
 #[tokio::test]

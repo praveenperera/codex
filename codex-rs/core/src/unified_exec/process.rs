@@ -38,6 +38,7 @@ use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const WATCHDOG_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_RUNNING: u8 = 0;
 const PROCESS_TERMINATING: u8 = 1;
 const PROCESS_TIMED_OUT: u8 = 2;
@@ -220,7 +221,10 @@ impl UnifiedExecProcess {
             return;
         };
         let process = Arc::clone(self);
-        let deadline = self.spawned_at + Duration::from_millis(watchdog.timeout_ms);
+        let deadline = self
+            .spawned_at
+            .checked_add(Duration::from_millis(watchdog.timeout_ms))
+            .unwrap_or(self.spawned_at);
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {}
@@ -242,20 +246,36 @@ impl UnifiedExecProcess {
             }
 
             let grace_period = Duration::from_millis(watchdog.grace_period_ms);
-            if grace_period.is_zero() || process.interrupt().await.is_err() {
-                process.terminate();
-                return;
-            }
-
-            tokio::select! {
-                _ = process.cancellation_token.cancelled() => {}
-                _ = tokio::time::sleep(grace_period) => {
-                    if !process.has_exited() {
-                        process.terminate();
+            if !grace_period.is_zero() {
+                let grace_deadline = Instant::now() + grace_period;
+                let interrupt_result = tokio::select! {
+                    _ = process.cancellation_token.cancelled() => return,
+                    result = tokio::time::timeout_at(grace_deadline, process.interrupt()) => result,
+                };
+                if matches!(interrupt_result, Ok(Ok(()))) {
+                    tokio::select! {
+                        _ = process.cancellation_token.cancelled() => return,
+                        _ = tokio::time::sleep_until(grace_deadline) => {}
                     }
                 }
             }
+
+            if !process.has_exited() {
+                process.terminate_for_watchdog().await;
+            }
         });
+    }
+
+    async fn terminate_for_watchdog(&self) {
+        match &self.process_handle {
+            ProcessHandle::Local(process_handle) => process_handle.terminate(),
+            ProcessHandle::ExecServer(process_handle) => {
+                let _ =
+                    tokio::time::timeout(WATCHDOG_TERMINATE_TIMEOUT, process_handle.terminate())
+                        .await;
+            }
+        }
+        self.finish_termination();
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {
