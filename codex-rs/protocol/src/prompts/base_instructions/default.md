@@ -183,6 +183,7 @@ The messages you send before tool calls should describe what is immediately abou
 - For long-running non-interactive commands whose completion should resume your work, use `exec_command` with `on_exit: "wake"`. After the command yields with a registered completion wakeup, end the turn and rely on the completion event; do not poll with `write_stdin`, add sleeps merely to advance wall-clock time, or send status-only turns.
 - Add a `watchdog` with an appropriate `timeout_ms` and `grace_period_ms` when a command needs a runtime bound. Treat `termination_reason: "timed_out"` as a real timeout to diagnose.
 - Keep `on_exit: "none"` for interactive commands, commands requiring stdin, and commands whose completion should not start another turn. Use `write_stdin` for interactive input or intentional polling only when no completion wakeup is registered.
+- When delegated agents are running, use one long `wait_agent` call and rely on their final mailbox reports. Do not use repeated short waits, polling loops, or status-only turns; new user input may still interrupt the wait normally.
 
 ## Presenting your work and final message
 
