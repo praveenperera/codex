@@ -437,6 +437,7 @@ fn exec_command_tool_output_formats_truncated_response() {
         output_omitted_bytes: None,
         hook_command: None,
         completion_notification: None,
+        termination_reason: None,
     }
     .to_response_item("call-42", &payload);
 
@@ -465,6 +466,39 @@ fn exec_command_tool_output_formats_truncated_response() {
 }
 
 #[test]
+fn timed_out_exec_command_code_mode_result_includes_termination_reason() {
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-timeout".to_string(),
+        chunk_id: "chunk-timeout".to_string(),
+        wall_time: std::time::Duration::from_secs(1),
+        raw_output: Vec::new(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(-1),
+        original_token_count: Some(0),
+        output_omitted_bytes: None,
+        hook_command: None,
+        completion_notification: None,
+        termination_reason: Some(crate::unified_exec::ExecCommandTerminationReason::TimedOut),
+    };
+
+    assert_eq!(
+        output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".to_string(),
+        }),
+        json!({
+            "chunk_id": "chunk-timeout",
+            "wall_time_seconds": 1.0,
+            "exit_code": -1,
+            "original_token_count": 0,
+            "output": "",
+            "termination_reason": "timed_out",
+        })
+    );
+}
+
+#[test]
 fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -489,6 +523,7 @@ fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
         output_omitted_bytes: NonZeroUsize::new(/*n*/ 123_456),
         hook_command: None,
         completion_notification: None,
+        termination_reason: None,
     }
     .to_response_item("call-omitted", &payload);
 

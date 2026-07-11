@@ -82,6 +82,55 @@ pub(crate) enum ExecCommandOnExit {
     Wake,
 }
 
+const DEFAULT_WATCHDOG_GRACE_PERIOD_MS: u64 = 5_000;
+const MAX_WATCHDOG_GRACE_PERIOD_MS: u64 = 30_000;
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecCommandWatchdog {
+    #[serde(deserialize_with = "deserialize_positive_timeout_ms")]
+    pub(crate) timeout_ms: u64,
+    #[serde(
+        default = "default_watchdog_grace_period_ms",
+        deserialize_with = "deserialize_watchdog_grace_period_ms"
+    )]
+    pub(crate) grace_period_ms: u64,
+}
+
+fn default_watchdog_grace_period_ms() -> u64 {
+    DEFAULT_WATCHDOG_GRACE_PERIOD_MS
+}
+
+fn deserialize_positive_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let timeout_ms = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    if timeout_ms == 0 {
+        return Err(serde::de::Error::custom("timeout_ms must be positive"));
+    }
+    Ok(timeout_ms)
+}
+
+fn deserialize_watchdog_grace_period_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let grace_period_ms = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    if grace_period_ms > MAX_WATCHDOG_GRACE_PERIOD_MS {
+        return Err(serde::de::Error::custom(
+            "grace_period_ms must be between 0 and 30000",
+        ));
+    }
+    Ok(grace_period_ms)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecCommandTerminationReason {
+    TimedOut,
+}
+
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub turn: Arc<TurnContext>,
@@ -107,6 +156,7 @@ pub(crate) struct ExecCommandRequest {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub on_exit: ExecCommandOnExit,
+    pub watchdog: Option<ExecCommandWatchdog>,
     pub cwd: PathUri,
     pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,

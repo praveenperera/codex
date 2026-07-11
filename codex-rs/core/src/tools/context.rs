@@ -327,6 +327,7 @@ pub struct ExecCommandToolOutput {
     pub output_omitted_bytes: Option<NonZeroUsize>,
     pub hook_command: Option<String>,
     pub completion_notification: Option<ExecCommandCompletionNotification>,
+    pub termination_reason: Option<crate::unified_exec::ExecCommandTerminationReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -394,6 +395,8 @@ impl ToolOutput for ExecCommandToolOutput {
             output: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             completion_notification: Option<ExecCommandCompletionNotification>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            termination_reason: Option<crate::unified_exec::ExecCommandTerminationReason>,
         }
 
         let result = UnifiedExecCodeModeResult {
@@ -407,6 +410,7 @@ impl ToolOutput for ExecCommandToolOutput {
                 None => String::from_utf8_lossy(&self.raw_output).to_string(),
             },
             completion_notification: self.completion_notification,
+            termination_reason: self.termination_reason,
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {

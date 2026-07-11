@@ -65,6 +65,32 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
 }
 
 #[test]
+fn exec_command_watchdog_defaults_grace_period() -> anyhow::Result<()> {
+    let args: ExecCommandArgs =
+        parse_arguments(r#"{"cmd":"sleep 1","watchdog":{"timeout_ms":10}}"#)?;
+
+    assert_eq!(
+        args.watchdog,
+        Some(crate::unified_exec::ExecCommandWatchdog {
+            timeout_ms: 10,
+            grace_period_ms: 5_000,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn exec_command_watchdog_rejects_invalid_limits() {
+    for arguments in [
+        r#"{"cmd":"sleep 1","watchdog":{"timeout_ms":0}}"#,
+        r#"{"cmd":"sleep 1","watchdog":{"timeout_ms":10,"grace_period_ms":30001}}"#,
+        r#"{"cmd":"sleep 1","watchdog":{}}"#,
+    ] {
+        assert!(parse_arguments::<ExecCommandArgs>(arguments).is_err());
+    }
+}
+
+#[test]
 fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
     let json = r#"{"cmd": "echo hello", "shell": "/bin/bash"}"#;
 
@@ -304,6 +330,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
         completion_notification: None,
+        termination_reason: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
     let handler = ExecCommandHandler::default();
@@ -336,6 +363,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
         completion_notification: None,
+        termination_reason: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
     let handler = ExecCommandHandler::default();
@@ -369,6 +397,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
         completion_notification: None,
+        termination_reason: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
     let handler = ExecCommandHandler::default();
@@ -397,6 +426,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         completion_notification: None,
+        termination_reason: None,
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
     let handler = WriteStdinHandler;
@@ -430,6 +460,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         output_omitted_bytes: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         completion_notification: None,
+        termination_reason: None,
     };
     let output_b = ExecCommandToolOutput {
         event_call_id: "exec-call-b".to_string(),
@@ -444,6 +475,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         completion_notification: None,
+        termination_reason: None,
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;

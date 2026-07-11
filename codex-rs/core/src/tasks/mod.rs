@@ -44,6 +44,7 @@ use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -452,7 +453,8 @@ impl Session {
 
     /// Starts a regular turn when the session is idle and pending work is waiting.
     ///
-    /// Pending work currently includes mailbox mail marked with `trigger_turn`.
+    /// Trigger-turn mailbox mail takes precedence over batched exec completion wakeups. Ready
+    /// exec completions can share the same default-mode continuation.
     ///
     /// This helper generates a fresh sub-id for the synthetic turn before delegating to the
     /// explicit-sub-id variant.
@@ -464,29 +466,69 @@ impl Session {
     /// Starts a regular turn with the provided sub-id when pending work should wake an idle
     /// session.
     ///
-    /// The turn is created only when there is mailbox mail marked with `trigger_turn`, and only
-    /// if the session is currently idle.
+    /// The provided sub-id is used for a trigger-turn mailbox continuation. Exec-only
+    /// continuations use the normal idle-turn path and generate their own sub-id.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if !self.input_queue.has_trigger_turn_mailbox_items().await {
+        let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
+        if !has_trigger_turn && !self.input_queue.has_ready_exec_wakeups().await {
+            return;
+        }
+        if !has_trigger_turn && self.collaboration_mode().await.mode == ModeKind::Plan {
             return;
         }
 
-        {
+        let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
                 return;
             }
-            *active_turn = Some(ActiveTurn::default());
-        }
+            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+            Arc::clone(&active_turn.turn_state)
+        };
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
+        if !has_trigger_turn && turn_context.collaboration_mode.mode == ModeKind::Plan {
+            let mut active_turn = self.active_turn.lock().await;
+            if active_turn.as_ref().is_some_and(|active_turn| {
+                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+            }) {
+                *active_turn = None;
+            }
+            return;
+        }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        let mut input = self.input_queue.drain_mailbox_input_items().await;
+        let ready_exec_wakeups = if turn_context.collaboration_mode.mode == ModeKind::Default {
+            self.input_queue.take_ready_exec_wakeups().await
+        } else {
+            Default::default()
+        };
+        input.extend(
+            ready_exec_wakeups
+                .iter()
+                .map(|(_, item)| TurnInput::ResponseItem(item.clone())),
+        );
+        if input.is_empty() {
+            let mut active_turn = self.active_turn.lock().await;
+            if active_turn.as_ref().is_some_and(|active_turn| {
+                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+            }) {
+                *active_turn = None;
+            }
+            return;
+        }
+        self.start_task(turn_context, input, RegularTask::new())
             .await;
+        for (process_id, _) in ready_exec_wakeups {
+            self.services
+                .unified_exec_manager
+                .mark_completion_delivered(process_id)
+                .await;
+        }
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -799,7 +841,7 @@ impl Session {
             }
         };
         if cleared_active_turn {
-            self.emit_thread_idle_lifecycle_if_idle().await;
+            self.handle_thread_idle_transition().await;
         }
         // Regular items were flushed before this terminal event was appended; buffering
         // thread writers may not flush it without another explicit barrier.

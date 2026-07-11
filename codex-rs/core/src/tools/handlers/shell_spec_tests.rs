@@ -74,6 +74,7 @@ fn exec_command_tool_matches_expected_spec() {
                 Some("Action after a yielded background command exits. `wake` starts one batched continuation; defaults to `none`.".to_string()),
             ),
         ),
+        ("watchdog".to_string(), watchdog_schema()),
         (
             "login".to_string(),
             JsonSchema::boolean(Some(

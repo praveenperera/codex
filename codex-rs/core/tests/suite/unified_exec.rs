@@ -3413,6 +3413,67 @@ async fn unified_exec_runs_on_all_platforms() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_wake_starts_one_completion_turn_after_process_exit() -> Result<()> {
+    skip_if_host_windows!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let call_id = "uexec-wake";
+    let args = serde_json::json!({
+        "cmd": "sleep 1; printf wake-marker",
+        "yield_time_ms": 250,
+        "on_exit": "wake",
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-wake-1"),
+                ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-wake-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-wake-2"),
+                ev_assistant_message("msg-wake-started", "background command started"),
+                ev_completed("resp-wake-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-wake-3"),
+                ev_assistant_message("msg-wake-complete", "completion received"),
+                ev_completed("resp-wake-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    submit_unified_exec_turn(&test, "start wake command", PermissionProfile::Disabled).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let completion_request = requests[2].body_json().to_string();
+    assert!(completion_request.contains("<exec_command_completion>"));
+    assert!(completion_request.contains("wake-marker"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn unified_exec_prunes_exited_sessions_first() -> Result<()> {
     skip_if_no_network!(Ok(()));

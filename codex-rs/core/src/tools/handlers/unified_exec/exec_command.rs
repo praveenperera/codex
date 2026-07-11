@@ -228,7 +228,6 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let process_id = manager.allocate_process_id().await;
         let resolved_command = get_command(
             &args,
             shell,
@@ -245,6 +244,7 @@ impl ExecCommandHandler {
             yield_time_ms,
             max_output_tokens,
             on_exit,
+            watchdog,
             sandbox_permissions,
             additional_permissions,
             justification,
@@ -281,7 +281,6 @@ impl ExecCommandHandler {
             )
         {
             let approval_policy = context.turn.approval_policy.value();
-            manager.release_process_id(process_id).await;
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
@@ -307,7 +306,6 @@ impl ExecCommandHandler {
         ) {
             Ok(normalized) => normalized,
             Err(err) => {
-                manager.release_process_id(process_id).await;
                 return Err(FunctionCallError::RespondToModel(err));
             }
         };
@@ -325,7 +323,6 @@ impl ExecCommandHandler {
         )
         .await?
         {
-            manager.release_process_id(process_id).await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {
                 event_call_id: String::new(),
                 chunk_id: String::new(),
@@ -339,8 +336,14 @@ impl ExecCommandHandler {
                 output_omitted_bytes: None,
                 hook_command: None,
                 completion_notification: None,
+                termination_reason: None,
             }));
         }
+
+        let process_id = manager
+            .allocate_process_id()
+            .await
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         match manager
@@ -353,6 +356,7 @@ impl ExecCommandHandler {
                     yield_time_ms,
                     max_output_tokens,
                     on_exit,
+                    watchdog,
                     cwd,
                     sandbox_cwd: native_environment_cwd,
                     turn_environment: turn_environment.clone(),
@@ -395,6 +399,7 @@ impl ExecCommandHandler {
                     output_omitted_bytes,
                     hook_command: Some(hook_command),
                     completion_notification: None,
+                    termination_reason: None,
                 }))
             }
             Err(err) => Err(FunctionCallError::RespondToModel(format!(

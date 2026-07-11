@@ -7,10 +7,9 @@ use codex_protocol::user_input::UserInput;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-
-const MAX_PENDING_EXEC_WAKEUPS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TurnInput {
@@ -38,8 +37,14 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
-    exec_wakeups: Mutex<VecDeque<(i32, ResponseItem)>>,
+    exec_wakeups: Mutex<ExecWakeups>,
     pub(crate) exec_wakeup_timer_running: AtomicBool,
+}
+
+#[derive(Default)]
+struct ExecWakeups {
+    batching: VecDeque<(i32, ResponseItem)>,
+    ready: VecDeque<(i32, ResponseItem)>,
 }
 
 impl InputQueue {
@@ -48,40 +53,47 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
-            exec_wakeups: Mutex::new(VecDeque::new()),
+            exec_wakeups: Mutex::new(ExecWakeups::default()),
             exec_wakeup_timer_running: AtomicBool::new(false),
         }
     }
 
     pub(crate) async fn enqueue_exec_wakeup(&self, process_id: i32, item: ResponseItem) {
         let mut wakeups = self.exec_wakeups.lock().await;
-        if wakeups.len() < MAX_PENDING_EXEC_WAKEUPS
-            && !wakeups
-                .iter()
-                .any(|(queued_id, _)| *queued_id == process_id)
+        if !wakeups
+            .batching
+            .iter()
+            .chain(wakeups.ready.iter())
+            .any(|(queued_id, _)| *queued_id == process_id)
         {
-            wakeups.push_back((process_id, item));
+            wakeups.batching.push_back((process_id, item));
         }
     }
 
     pub(crate) async fn remove_exec_wakeup(&self, process_id: i32) {
-        self.exec_wakeups
-            .lock()
-            .await
+        let mut wakeups = self.exec_wakeups.lock().await;
+        wakeups
+            .batching
+            .retain(|(queued_id, _)| *queued_id != process_id);
+        wakeups
+            .ready
             .retain(|(queued_id, _)| *queued_id != process_id);
     }
 
-    pub(crate) async fn drain_exec_wakeups(&self) -> Vec<ResponseItem> {
-        self.exec_wakeups
-            .lock()
-            .await
-            .drain(..)
-            .map(|(_, item)| item)
-            .collect()
+    pub(crate) async fn finish_exec_wakeup_batch(&self) {
+        let mut wakeups = self.exec_wakeups.lock().await;
+        let batching = std::mem::take(&mut wakeups.batching);
+        wakeups.ready.extend(batching);
+        self.exec_wakeup_timer_running
+            .store(false, Ordering::Release);
     }
 
-    pub(crate) async fn has_exec_wakeups(&self) -> bool {
-        !self.exec_wakeups.lock().await.is_empty()
+    pub(crate) async fn has_ready_exec_wakeups(&self) -> bool {
+        !self.exec_wakeups.lock().await.ready.is_empty()
+    }
+
+    pub(crate) async fn take_ready_exec_wakeups(&self) -> VecDeque<(i32, ResponseItem)> {
+        std::mem::take(&mut self.exec_wakeups.lock().await.ready)
     }
 
     pub(crate) async fn subscribe_activity(
@@ -454,5 +466,56 @@ mod tests {
             ))
             .await;
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn exec_wakeups_are_hidden_until_the_batch_is_ready() {
+        let input_queue = InputQueue::new();
+        let item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: Vec::new(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        input_queue.enqueue_exec_wakeup(7, item.clone()).await;
+        assert!(!input_queue.has_ready_exec_wakeups().await);
+
+        input_queue.finish_exec_wakeup_batch().await;
+
+        assert!(input_queue.has_ready_exec_wakeups().await);
+        assert_eq!(
+            VecDeque::from([(7, item)]),
+            input_queue.take_ready_exec_wakeups().await
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_exec_wakeup_batches_preserve_identity_and_order() {
+        let input_queue = InputQueue::new();
+        let first = ResponseItem::Message {
+            id: Some("first".to_string()),
+            role: "user".to_string(),
+            content: Vec::new(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let second = ResponseItem::Message {
+            id: Some("second".to_string()),
+            role: "user".to_string(),
+            content: Vec::new(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        input_queue.enqueue_exec_wakeup(11, first.clone()).await;
+        input_queue.finish_exec_wakeup_batch().await;
+        input_queue.enqueue_exec_wakeup(12, second.clone()).await;
+        input_queue.finish_exec_wakeup_batch().await;
+
+        assert_eq!(
+            VecDeque::from([(11, first), (12, second)]),
+            input_queue.take_ready_exec_wakeups().await
+        );
     }
 }

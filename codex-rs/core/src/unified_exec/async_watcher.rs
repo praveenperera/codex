@@ -152,11 +152,14 @@ pub(crate) fn spawn_exit_watcher(
                 String::new(),
                 exit_code,
                 duration,
+                process.termination_reason().is_some(),
             )
             .await;
         }
         if let Some(completion_wakeup) = completion_wakeup {
-            completion_wakeup.complete(exit_code, duration).await;
+            completion_wakeup
+                .complete(exit_code, duration, process.termination_reason())
+                .await;
         }
     });
 }
@@ -208,6 +211,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     fallback_output: String,
     exit_code: i32,
     duration: Duration,
+    timed_out: bool,
 ) {
     let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
     let output = ExecToolCallOutput {
@@ -216,7 +220,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
-        timed_out: false,
+        timed_out,
     };
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),

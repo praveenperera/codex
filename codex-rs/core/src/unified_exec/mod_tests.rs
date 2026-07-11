@@ -99,7 +99,7 @@ async fn exec_command_with_tty(
     tty: bool,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
-    let process_id = manager.allocate_process_id().await;
+    let process_id = manager.allocate_process_id().await?;
     #[allow(deprecated)]
     let cwd = workdir
         .as_ref()
@@ -207,6 +207,7 @@ async fn exec_command_with_tty(
         output_omitted_bytes,
         hook_command: Some(cmd.to_string()),
         completion_notification: None,
+        termination_reason: None,
     })
 }
 
@@ -659,7 +660,7 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
 async fn terminating_initial_exec_command_rechecks_initial_response_state() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;
-    let process_id = manager.allocate_process_id().await;
+    let process_id = manager.allocate_process_id().await?;
     let (terminate_started_tx, mut terminate_started_rx) = watch::channel(false);
     let allow_terminate = Arc::new(Notify::new());
     let process = blocking_terminate_unified_process(
@@ -732,7 +733,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
 async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;
-    let process_id = manager.allocate_process_id().await;
+    let process_id = manager.allocate_process_id().await?;
     let (terminate_started_tx, _terminate_started_rx) = watch::channel(false);
     let allow_terminate = Arc::new(Notify::new());
     let process = blocking_terminate_unified_process(

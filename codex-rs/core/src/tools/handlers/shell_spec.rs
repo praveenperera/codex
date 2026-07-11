@@ -61,6 +61,10 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
                 Some("Action after a yielded background command exits. `wake` starts one batched continuation; defaults to `none`.".to_string()),
             ),
         ),
+        (
+            "watchdog".to_string(),
+            watchdog_schema(),
+        ),
     ]);
     if include_shell_parameter {
         properties.insert(
@@ -112,6 +116,28 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         ),
         output_schema: Some(unified_exec_output_schema()),
     })
+}
+
+fn watchdog_schema() -> JsonSchema {
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "timeout_ms".to_string(),
+                JsonSchema::number(Some(
+                    "Required positive command runtime limit in milliseconds.".to_string(),
+                )),
+            ),
+            (
+                "grace_period_ms".to_string(),
+                JsonSchema::number(Some(
+                    "Wait after interrupting before hard termination. Defaults to 5000 ms; range is 0-30000 ms."
+                        .to_string(),
+                )),
+            ),
+        ]),
+        Some(vec!["timeout_ms".to_string()]),
+        Some(false.into()),
+    )
 }
 
 pub fn create_write_stdin_tool() -> ToolSpec {
@@ -297,6 +323,11 @@ fn unified_exec_output_schema() -> Value {
                 "type": "string",
                 "enum": ["registered"],
                 "description": "Registration status for an opt-in completion wakeup."
+            },
+            "termination_reason": {
+                "type": "string",
+                "enum": ["timed_out"],
+                "description": "Reason the process was terminated."
             }
         },
         "required": ["wall_time_seconds", "output"],

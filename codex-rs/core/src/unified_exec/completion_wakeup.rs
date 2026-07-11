@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_context_fragments::ContextualUserFragment;
@@ -9,6 +11,7 @@ use tokio::sync::Mutex;
 use crate::context::ExecCommandCompletion;
 use crate::session::session::Session;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::unified_exec::ExecCommandTerminationReason;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::generate_chunk_id;
 
@@ -24,12 +27,13 @@ struct CompletionWakeRegistrationInner {
     command: String,
     max_output_tokens: Option<usize>,
     truncation_policy: TruncationPolicy,
+    delivery_pending: AtomicBool,
 }
 
 #[derive(Default)]
 struct CompletionWakeState {
     armed: bool,
-    completed: Option<(i32, Duration)>,
+    completed: Option<(i32, Duration, Option<ExecCommandTerminationReason>)>,
     observed: bool,
 }
 
@@ -52,7 +56,16 @@ impl CompletionWakeRegistration {
             command,
             max_output_tokens,
             truncation_policy,
+            delivery_pending: AtomicBool::new(true),
         }))
+    }
+
+    pub(crate) fn delivery_pending(&self) -> bool {
+        self.0.delivery_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn delivered(&self) {
+        self.0.delivery_pending.store(false, Ordering::Release);
     }
 
     pub(crate) async fn arm(&self) {
@@ -61,12 +74,17 @@ impl CompletionWakeRegistration {
             state.armed = true;
             state.completed.take().filter(|_| !state.observed)
         };
-        if let Some((exit_code, duration)) = completed {
-            self.enqueue(exit_code, duration).await;
+        if let Some((exit_code, duration, termination_reason)) = completed {
+            self.enqueue(exit_code, duration, termination_reason).await;
         }
     }
 
-    pub(crate) async fn complete(&self, exit_code: i32, duration: Duration) {
+    pub(crate) async fn complete(
+        &self,
+        exit_code: i32,
+        duration: Duration,
+        termination_reason: Option<ExecCommandTerminationReason>,
+    ) {
         let should_enqueue = {
             let mut state = self.0.state.lock().await;
             if state.observed {
@@ -74,16 +92,17 @@ impl CompletionWakeRegistration {
             } else if state.armed {
                 true
             } else {
-                state.completed = Some((exit_code, duration));
+                state.completed = Some((exit_code, duration, termination_reason));
                 false
             }
         };
         if should_enqueue {
-            self.enqueue(exit_code, duration).await;
+            self.enqueue(exit_code, duration, termination_reason).await;
         }
     }
 
     pub(crate) async fn observed(&self) {
+        self.delivered();
         self.0.state.lock().await.observed = true;
         if let Some(session) = self.0.session.upgrade() {
             session
@@ -93,7 +112,12 @@ impl CompletionWakeRegistration {
         }
     }
 
-    async fn enqueue(&self, exit_code: i32, duration: Duration) {
+    async fn enqueue(
+        &self,
+        exit_code: i32,
+        duration: Duration,
+        termination_reason: Option<ExecCommandTerminationReason>,
+    ) {
         let Some(session) = self.0.session.upgrade() else {
             return;
         };
@@ -111,6 +135,7 @@ impl CompletionWakeRegistration {
             output_omitted_bytes: std::num::NonZeroUsize::new(drained.omitted_bytes()),
             hook_command: None,
             completion_notification: None,
+            termination_reason,
         };
         let fragment = ExecCommandCompletion::new(
             self.0.call_id.clone(),
@@ -119,6 +144,7 @@ impl CompletionWakeRegistration {
             exit_code,
             duration,
             output.model_output(),
+            termination_reason,
         );
         session
             .input_queue

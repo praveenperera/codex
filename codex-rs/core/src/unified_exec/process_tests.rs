@@ -13,6 +13,8 @@ use codex_exec_server::WriteStatus;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -22,6 +24,8 @@ struct MockExecProcess {
     read_responses: Mutex<VecDeque<ReadResponse>>,
     terminate_error: Option<String>,
     wake_tx: watch::Sender<u64>,
+    signal_count: AtomicUsize,
+    terminate_count: AtomicUsize,
 }
 
 impl MockExecProcess {
@@ -43,6 +47,7 @@ impl MockExecProcess {
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
+        self.terminate_count.fetch_add(1, Ordering::SeqCst);
         if let Some(message) = &self.terminate_error {
             return Err(ExecServerError::Protocol(message.clone()));
         }
@@ -77,6 +82,7 @@ impl ExecProcess for MockExecProcess {
     }
 
     fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        self.signal_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
 
@@ -89,22 +95,103 @@ async fn remote_process(
     write_status: WriteStatus,
     terminate_error: Option<String>,
 ) -> UnifiedExecProcess {
+    remote_process_with_handle(write_status, terminate_error)
+        .await
+        .0
+}
+
+async fn remote_process_with_handle(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+) -> (UnifiedExecProcess, Arc<MockExecProcess>) {
     let (wake_tx, _wake_rx) = watch::channel(0);
+    let process = Arc::new(MockExecProcess {
+        process_id: "test-process".to_string().into(),
+        write_response: WriteResponse {
+            status: write_status,
+        },
+        read_responses: Mutex::new(VecDeque::new()),
+        terminate_error,
+        wake_tx,
+        signal_count: AtomicUsize::new(0),
+        terminate_count: AtomicUsize::new(0),
+    });
     let started = StartedExecProcess {
-        process: Arc::new(MockExecProcess {
-            process_id: "test-process".to_string().into(),
-            write_response: WriteResponse {
-                status: write_status,
-            },
-            read_responses: Mutex::new(VecDeque::new()),
-            terminate_error,
-            wake_tx,
-        }),
+        process: process.clone(),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started)
+    (
+        UnifiedExecProcess::from_exec_server_started(started)
+            .await
+            .expect("remote process should start"),
+        process,
+    )
+}
+
+#[tokio::test]
+async fn watchdog_with_zero_grace_hard_terminates_without_interrupt() {
+    let (process, handle) =
+        remote_process_with_handle(WriteStatus::Accepted, /*terminate_error*/ None).await;
+    let process = Arc::new(process);
+
+    process.start_watchdog(Some(crate::unified_exec::ExecCommandWatchdog {
+        timeout_ms: 1,
+        grace_period_ms: 0,
+    }));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        process.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("watchdog should terminate the process");
+
+    assert_eq!(
+        process.termination_reason(),
+        Some(crate::unified_exec::ExecCommandTerminationReason::TimedOut)
+    );
+    assert_eq!(handle.signal_count.load(Ordering::SeqCst), 0);
+    assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn watchdog_interrupts_before_hard_termination_after_grace_period() {
+    let (process, handle) =
+        remote_process_with_handle(WriteStatus::Accepted, /*terminate_error*/ None).await;
+    let process = Arc::new(process);
+
+    process.start_watchdog(Some(crate::unified_exec::ExecCommandWatchdog {
+        timeout_ms: 1,
+        grace_period_ms: 10,
+    }));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        process.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("watchdog should terminate the process after grace");
+
+    assert_eq!(handle.signal_count.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn natural_exit_before_deadline_is_not_timed_out() {
+    let (process, handle) =
+        remote_process_with_handle(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
+    let process = Arc::new(process);
+    process
+        .write(b"probe")
         .await
-        .expect("remote process should start")
+        .expect_err("unknown remote process should report a closed session");
+
+    process.start_watchdog(Some(crate::unified_exec::ExecCommandWatchdog {
+        timeout_ms: 1,
+        grace_period_ms: 0,
+    }));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    assert_eq!(process.termination_reason(), None);
+    assert_eq!(handle.terminate_count.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

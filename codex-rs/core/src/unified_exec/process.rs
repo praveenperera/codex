@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -10,6 +11,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::is_likely_sandbox_denied;
@@ -28,12 +30,18 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
+use super::ExecCommandTerminationReason;
+use super::ExecCommandWatchdog;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const PROCESS_RUNNING: u8 = 0;
+const PROCESS_TERMINATING: u8 = 1;
+const PROCESS_TIMED_OUT: u8 = 2;
+const PROCESS_EXITED: u8 = 3;
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     /// Returns file descriptors that must stay open across the child `exec()`.
     ///
@@ -86,6 +94,8 @@ pub(crate) struct UnifiedExecProcess {
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
     sandbox_type: SandboxType,
+    lifecycle: Arc<AtomicU8>,
+    spawned_at: Instant,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
 }
 
@@ -127,6 +137,8 @@ impl UnifiedExecProcess {
             state_rx,
             output_task: None,
             sandbox_type,
+            lifecycle: Arc::new(AtomicU8::new(PROCESS_RUNNING)),
+            spawned_at: Instant::now(),
             _spawn_lifecycle: spawn_lifecycle,
         }
     }
@@ -143,6 +155,12 @@ impl UnifiedExecProcess {
                     Ok(response) => match response.status {
                         WriteStatus::Accepted => Ok(()),
                         WriteStatus::UnknownProcess | WriteStatus::StdinClosed => {
+                            let _ = self.lifecycle.compare_exchange(
+                                PROCESS_RUNNING,
+                                PROCESS_EXITED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
                             let state = self.state_rx.borrow().clone();
                             let _ = self.state_tx.send_replace(state.exited(state.exit_code));
                             self.cancellation_token.cancel();
@@ -192,6 +210,54 @@ impl UnifiedExecProcess {
         }
     }
 
+    pub(super) fn termination_reason(&self) -> Option<ExecCommandTerminationReason> {
+        (self.lifecycle.load(Ordering::Acquire) == PROCESS_TIMED_OUT)
+            .then_some(ExecCommandTerminationReason::TimedOut)
+    }
+
+    pub(super) fn start_watchdog(self: &Arc<Self>, watchdog: Option<ExecCommandWatchdog>) {
+        let Some(watchdog) = watchdog else {
+            return;
+        };
+        let process = Arc::clone(self);
+        let deadline = self.spawned_at + Duration::from_millis(watchdog.timeout_ms);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = process.cancellation_token.cancelled() => return,
+            }
+
+            if process.has_exited()
+                || process
+                    .lifecycle
+                    .compare_exchange(
+                        PROCESS_RUNNING,
+                        PROCESS_TIMED_OUT,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                return;
+            }
+
+            let grace_period = Duration::from_millis(watchdog.grace_period_ms);
+            if grace_period.is_zero() || process.interrupt().await.is_err() {
+                process.terminate();
+                return;
+            }
+
+            tokio::select! {
+                _ = process.cancellation_token.cancelled() => {}
+                _ = tokio::time::sleep(grace_period) => {
+                    if !process.has_exited() {
+                        process.terminate();
+                    }
+                }
+            }
+        });
+    }
+
     pub(super) fn exit_code(&self) -> Option<i32> {
         let state = self.state_rx.borrow().clone();
         match &self.process_handle {
@@ -212,6 +278,12 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn terminate(&self) {
+        let _ = self.lifecycle.compare_exchange(
+            PROCESS_RUNNING,
+            PROCESS_TERMINATING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -225,6 +297,12 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+        let _ = self.lifecycle.compare_exchange(
+            PROCESS_RUNNING,
+            PROCESS_TERMINATING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -252,6 +330,12 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn fail_and_terminate(&self, message: String) {
+        let _ = self.lifecycle.compare_exchange(
+            PROCESS_RUNNING,
+            PROCESS_TERMINATING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         let state = self.state_rx.borrow().clone();
         if state.failure_message.is_none() {
             let _ = self.state_tx.send_replace(state.failed(message));
@@ -369,8 +453,15 @@ impl UnifiedExecProcess {
         tokio::spawn({
             let state_tx = managed.state_tx.clone();
             let cancellation_token = managed.cancellation_token.clone();
+            let lifecycle = Arc::clone(&managed.lifecycle);
             async move {
                 let exit_code = exit_rx.await.ok();
+                let _ = lifecycle.compare_exchange(
+                    PROCESS_RUNNING,
+                    PROCESS_EXITED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 let state = state_tx.borrow().clone();
                 let _ = state_tx.send_replace(state.exited(exit_code));
                 cancellation_token.cancel();
@@ -395,6 +486,7 @@ impl UnifiedExecProcess {
             output_handles,
             managed.output_tx.clone(),
             managed.state_tx.clone(),
+            Arc::clone(&managed.lifecycle),
         ));
 
         let mut state_rx = managed.state_rx.clone();
@@ -423,6 +515,7 @@ impl UnifiedExecProcess {
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
+        lifecycle: Arc<AtomicU8>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -513,6 +606,14 @@ impl UnifiedExecProcess {
                         break;
                     }
                     if sandbox_denied || exited {
+                        if exited {
+                            let _ = lifecycle.compare_exchange(
+                                PROCESS_RUNNING,
+                                PROCESS_EXITED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                        }
                         let mut state = state_tx.borrow().clone();
                         state.sandbox_denied |= sandbox_denied;
                         let _ = state_tx.send_replace(if exited {
@@ -555,6 +656,12 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = seq;
+                        let _ = lifecycle.compare_exchange(
+                            PROCESS_RUNNING,
+                            PROCESS_EXITED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                         let mut state = state_tx.borrow().clone();
                         state.sandbox_denied |= sandbox_denied.unwrap_or(false);
                         let _ = state_tx.send_replace(state.exited(Some(exit_code)));
@@ -611,6 +718,12 @@ impl UnifiedExecProcess {
     }
 
     fn signal_exit(&self, exit_code: Option<i32>) {
+        let _ = self.lifecycle.compare_exchange(
+            PROCESS_RUNNING,
+            PROCESS_EXITED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.cancellation_token.cancel();

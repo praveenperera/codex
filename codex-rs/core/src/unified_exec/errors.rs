@@ -20,6 +20,8 @@ pub(crate) enum UnifiedExecError {
     StdinClosed,
     #[error("missing command line for unified exec request")]
     MissingCommandLine,
+    #[error("too many unified exec processes; wait for or poll an existing process")]
+    ProcessCapacityReached,
     #[error("Command denied by sandbox: {message}")]
     SandboxDenied {
         message: String,

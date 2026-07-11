@@ -2,11 +2,20 @@ use codex_extension_api::ExtensionData;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
+use futures::future::BoxFuture;
+use std::sync::Arc;
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
 impl Session {
+    pub(crate) fn handle_thread_idle_transition(self: &Arc<Self>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.maybe_start_turn_for_pending_work().await;
+            self.emit_thread_idle_lifecycle_if_idle().await;
+        })
+    }
+
     pub(super) async fn emit_turn_start_lifecycle(
         &self,
         turn_context: &TurnContext,

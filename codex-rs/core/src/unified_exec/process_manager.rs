@@ -1,7 +1,5 @@
 use rand::Rng;
-use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -373,31 +371,42 @@ fn terminate_process_on_network_denial(
 }
 
 impl UnifiedExecProcessManager {
-    pub(crate) async fn allocate_process_id(&self) -> i32 {
-        loop {
+    pub(crate) async fn allocate_process_id(&self) -> Result<i32, UnifiedExecError> {
+        let (process_id, pruned_entry) = {
             let mut store = self.process_store.lock().await;
-
-            let process_id = if should_use_deterministic_process_ids() {
-                // test or deterministic mode
-                store
-                    .reserved_process_ids
-                    .iter()
-                    .copied()
-                    .max()
-                    .map(|m| std::cmp::max(m, 999) + 1)
-                    .unwrap_or(1000)
+            let pruned_entry = if store.reserved_process_ids.len() >= MAX_UNIFIED_EXEC_PROCESSES {
+                let Some(process_id) = Self::process_id_to_prune(&store) else {
+                    return Err(UnifiedExecError::ProcessCapacityReached);
+                };
+                store.remove(process_id)
             } else {
-                // production mode → random
-                rand::rng().random_range(1_000..100_000)
+                None
             };
 
-            if store.reserved_process_ids.contains(&process_id) {
-                continue;
-            }
+            let process_id = loop {
+                let candidate = if should_use_deterministic_process_ids() {
+                    store
+                        .reserved_process_ids
+                        .iter()
+                        .copied()
+                        .max()
+                        .map(|maximum| std::cmp::max(maximum, 999) + 1)
+                        .unwrap_or(1000)
+                } else {
+                    rand::rng().random_range(1_000..100_000)
+                };
+                if !store.reserved_process_ids.contains(&candidate) {
+                    break candidate;
+                }
+            };
 
             store.reserved_process_ids.insert(process_id);
-            return process_id;
+            (process_id, pruned_entry)
+        };
+        if let Some(pruned_entry) = pruned_entry {
+            unregister_network_approval_for_entry(&pruned_entry).await;
         }
+        Ok(process_id)
     }
 
     pub(crate) async fn release_process_id(&self, process_id: i32) {
@@ -407,6 +416,19 @@ impl UnifiedExecProcessManager {
         };
         if let Some(entry) = removed {
             unregister_network_approval_for_entry(&entry).await;
+        }
+    }
+
+    pub(crate) async fn mark_completion_delivered(&self, process_id: i32) {
+        let registration = self
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .and_then(|entry| entry.completion_wakeup.clone());
+        if let Some(registration) = registration {
+            registration.delivered();
         }
     }
 
@@ -429,6 +451,7 @@ impl UnifiedExecProcessManager {
                 return Err(err);
             }
         };
+        process.start_watchdog(request.watchdog);
         if let Some(deferred) = deferred_network_approval.as_ref() {
             terminate_process_on_network_denial(
                 Arc::clone(&process),
@@ -640,6 +663,7 @@ impl UnifiedExecProcessManager {
                 text.clone(),
                 exit,
                 wall_time,
+                process.termination_reason().is_some(),
             )
             .await;
 
@@ -668,6 +692,7 @@ impl UnifiedExecProcessManager {
             completion_notification: (response_process_id.is_some()
                 && request.on_exit == ExecCommandOnExit::Wake)
                 .then_some(ExecCommandCompletionNotification::Registered),
+            termination_reason: process.termination_reason(),
         };
 
         if response.process_id.is_some()
@@ -842,6 +867,7 @@ impl UnifiedExecProcessManager {
             output_omitted_bytes,
             hook_command: Some(hook_command),
             completion_notification: None,
+            termination_reason: process.termination_reason(),
         };
 
         Ok(response)
@@ -943,22 +969,9 @@ impl UnifiedExecProcessManager {
             last_used: started_at,
             completion_wakeup: completion_wakeup.clone(),
         };
-        let pruned_entry = {
+        {
             let mut store = self.process_store.lock().await;
-            let pruned_entry = Self::prune_processes_if_needed(&mut store);
             store.processes.insert(process_id, entry);
-            pruned_entry
-        };
-        // prune_processes_if_needed runs while holding process_store; do async
-        // network-approval cleanup only after dropping that lock.
-        if let Some(pruned_entry) = pruned_entry {
-            unregister_network_approval_for_entry(&pruned_entry).await;
-            if !pruned_entry.process.has_exited()
-                && let Some(completion_wakeup) = pruned_entry.completion_wakeup.as_ref()
-            {
-                completion_wakeup.observed().await;
-            }
-            pruned_entry.process.terminate();
         }
 
         spawn_exit_watcher(
@@ -1393,51 +1406,30 @@ impl UnifiedExecProcessManager {
         }
     }
 
-    fn prune_processes_if_needed(store: &mut ProcessStore) -> Option<ProcessEntry> {
-        if store.processes.len() < MAX_UNIFIED_EXEC_PROCESSES {
-            return None;
-        }
-
-        let meta: Vec<(i32, Instant, bool)> = store
+    fn process_id_to_prune(store: &ProcessStore) -> Option<i32> {
+        let meta = store
             .processes
             .iter()
-            .map(|(id, entry)| (*id, entry.last_used, entry.process.has_exited()))
-            .collect();
-
-        if let Some(process_id) = Self::process_id_to_prune_from_meta(&meta) {
-            return store.remove(process_id);
-        }
-
-        None
+            .map(|(process_id, entry)| {
+                (
+                    *process_id,
+                    entry.last_used,
+                    entry.process.has_exited()
+                        && entry
+                            .completion_wakeup
+                            .as_ref()
+                            .is_none_or(|registration| !registration.delivery_pending()),
+                )
+            })
+            .collect::<Vec<_>>();
+        Self::process_id_to_prune_from_meta(&meta)
     }
 
-    // Centralized pruning policy so we can easily swap strategies later.
     fn process_id_to_prune_from_meta(meta: &[(i32, Instant, bool)]) -> Option<i32> {
-        if meta.is_empty() {
-            return None;
-        }
-
-        let mut by_recency = meta.to_vec();
-        by_recency.sort_by_key(|(_, last_used, _)| Reverse(*last_used));
-        let protected: HashSet<i32> = by_recency
-            .iter()
-            .take(8)
+        meta.iter()
+            .filter(|(_, _, prunable)| *prunable)
+            .min_by_key(|(_, last_used, _)| *last_used)
             .map(|(process_id, _, _)| *process_id)
-            .collect();
-
-        let mut lru = meta.to_vec();
-        lru.sort_by_key(|(_, last_used, _)| *last_used);
-
-        if let Some((process_id, _, _)) = lru
-            .iter()
-            .find(|(process_id, _, exited)| !protected.contains(process_id) && *exited)
-        {
-            return Some(*process_id);
-        }
-
-        lru.into_iter()
-            .find(|(process_id, _, _)| !protected.contains(process_id))
-            .map(|(process_id, _, _)| process_id)
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
