@@ -657,6 +657,90 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_completion_wakeup_blocks_extension_idle_work() -> anyhow::Result<()> {
+    struct ThreadIdleRecorder(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for ThreadIdleRecorder {
+        fn on_thread_idle<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadIdleInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    let (mut session, turn) = make_session_and_context().await;
+    let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdleRecorder(Arc::clone(&idle_calls))));
+    session.services.extensions = Arc::new(extensions.build());
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let output = exec_command(
+        &session, &turn, "sleep 60", /*yield_time_ms*/ 250, None,
+    )
+    .await?;
+    let process_id = output.process_id.expect("background process id");
+    let manager = &session.services.unified_exec_manager;
+    let process = manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get(&process_id)
+        .expect("stored background process")
+        .process
+        .clone();
+    let completion_wakeup = CompletionWakeRegistration::new(
+        process,
+        Arc::downgrade(&session),
+        "call".to_string(),
+        process_id,
+        "sleep 60".to_string(),
+        None,
+        TruncationPolicy::Tokens(10_000),
+    );
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .expect("stored background process")
+        .completion_wakeup = Some(completion_wakeup.clone());
+
+    session.emit_thread_idle_lifecycle_if_idle().await;
+    assert_eq!(0, idle_calls.load(std::sync::atomic::Ordering::SeqCst));
+
+    let input = vec![codex_protocol::models::ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: Vec::new(),
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let err = session
+        .try_start_turn_if_idle(input)
+        .await
+        .expect_err("pending completion should block extension idle work");
+    assert_eq!(
+        crate::codex_thread::TryStartTurnIfIdleRejectionReason::Busy,
+        err.reason()
+    );
+
+    completion_wakeup.delivered();
+    assert!(!manager.has_pending_completion_wakeup().await);
+    session.emit_thread_idle_lifecycle_if_idle().await;
+    assert_eq!(1, idle_calls.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(session.terminate_background_terminal(process_id).await);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminating_initial_exec_command_rechecks_initial_response_state() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;

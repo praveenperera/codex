@@ -432,6 +432,20 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    pub(crate) async fn has_pending_completion_wakeup(&self) -> bool {
+        self.process_store
+            .lock()
+            .await
+            .processes
+            .values()
+            .any(|entry| {
+                entry
+                    .completion_wakeup
+                    .as_ref()
+                    .is_some_and(CompletionWakeRegistration::delivery_pending)
+            })
+    }
+
     pub(crate) async fn exec_command(
         &self,
         request: ExecCommandRequest,

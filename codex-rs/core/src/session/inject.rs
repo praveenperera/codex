@@ -55,6 +55,17 @@ impl Session {
                 input,
             ));
         }
+        if self
+            .services
+            .unified_exec_manager
+            .has_pending_completion_wakeup()
+            .await
+        {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                input,
+            ));
+        }
         if self.collaboration_mode().await.mode == ModeKind::Plan {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
@@ -79,6 +90,18 @@ impl Session {
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                input,
+            ));
+        }
+        if self
+            .services
+            .unified_exec_manager
+            .has_pending_completion_wakeup()
+            .await
+        {
+            self.clear_reserved_idle_turn(&turn_state).await;
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
                 input,
             ));
         }
