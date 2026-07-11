@@ -1,12 +1,9 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-
-use codex_context_fragments::ContextualUserFragment;
-use codex_utils_output_truncation::TruncationPolicy;
-use tokio::sync::Mutex;
 
 use crate::context::ExecCommandCompletion;
 use crate::session::session::Session;
@@ -14,6 +11,8 @@ use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::ExecCommandTerminationReason;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::generate_chunk_id;
+use codex_context_fragments::ContextualUserFragment;
+use codex_utils_output_truncation::TruncationPolicy;
 
 #[derive(Clone)]
 pub(crate) struct CompletionWakeRegistration(Arc<CompletionWakeRegistrationInner>);
@@ -68,9 +67,28 @@ impl CompletionWakeRegistration {
         self.0.delivery_pending.store(false, Ordering::Release);
     }
 
+    pub(crate) fn cancel_before_arm(&self) {
+        self.delivered();
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observed = true;
+        if let Some(session) = self.0.session.upgrade() {
+            let process_id = self.0.process_id;
+            tokio::spawn(async move {
+                session.input_queue.remove_exec_wakeup(process_id).await;
+            });
+        }
+    }
+
     pub(crate) async fn arm(&self) {
         let completed = {
-            let mut state = self.0.state.lock().await;
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.armed = true;
             state.completed.take().filter(|_| !state.observed)
         };
@@ -86,7 +104,11 @@ impl CompletionWakeRegistration {
         termination_reason: Option<ExecCommandTerminationReason>,
     ) {
         let should_enqueue = {
-            let mut state = self.0.state.lock().await;
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.observed {
                 false
             } else if state.armed {
@@ -103,7 +125,11 @@ impl CompletionWakeRegistration {
 
     pub(crate) async fn observed(&self) {
         self.delivered();
-        self.0.state.lock().await.observed = true;
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observed = true;
         if let Some(session) = self.0.session.upgrade() {
             session
                 .input_queue
@@ -150,7 +176,13 @@ impl CompletionWakeRegistration {
             .input_queue
             .enqueue_exec_wakeup(self.0.process_id, ContextualUserFragment::into(fragment))
             .await;
-        if self.0.state.lock().await.observed {
+        if self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observed
+        {
             session
                 .input_queue
                 .remove_exec_wakeup(self.0.process_id)

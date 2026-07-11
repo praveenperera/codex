@@ -215,13 +215,33 @@ struct PreparedProcessHandles {
     completion_wakeup: Option<CompletionWakeRegistration>,
 }
 
-struct InitialExecCommandGuard {
+pub(super) struct InitialExecCommandGuard {
     active: Arc<AtomicBool>,
+    completion_wakeup: Option<CompletionWakeRegistration>,
+}
+
+impl InitialExecCommandGuard {
+    pub(super) fn new(
+        active: Arc<AtomicBool>,
+        completion_wakeup: Option<CompletionWakeRegistration>,
+    ) -> Self {
+        Self {
+            active,
+            completion_wakeup,
+        }
+    }
+
+    fn completion_armed(&mut self) {
+        self.completion_wakeup = None;
+    }
 }
 
 impl Drop for InitialExecCommandGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
+        if let Some(completion_wakeup) = self.completion_wakeup.as_ref() {
+            completion_wakeup.cancel_before_arm();
+        }
     }
 }
 
@@ -506,7 +526,7 @@ impl UnifiedExecProcessManager {
                     context.turn.model_info.truncation_policy.into(),
                 )
             });
-        let _initial_exec_command_guard = if process_started_alive {
+        let mut initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
             self.store_process(
                 Arc::clone(&process),
@@ -523,9 +543,10 @@ impl UnifiedExecProcessManager {
                 completion_wakeup.clone(),
             )
             .await;
-            Some(InitialExecCommandGuard {
-                active: initial_exec_command_active,
-            })
+            Some(InitialExecCommandGuard::new(
+                initial_exec_command_active,
+                completion_wakeup.clone(),
+            ))
         } else {
             None
         };
@@ -713,6 +734,9 @@ impl UnifiedExecProcessManager {
             && let Some(completion_wakeup) = completion_wakeup
         {
             completion_wakeup.arm().await;
+            if let Some(initial_exec_command_guard) = initial_exec_command_guard.as_mut() {
+                initial_exec_command_guard.completion_armed();
+            }
         }
 
         Ok(response)

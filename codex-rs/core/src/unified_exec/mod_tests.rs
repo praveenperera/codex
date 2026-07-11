@@ -741,6 +741,74 @@ async fn pending_completion_wakeup_blocks_extension_idle_work() -> anyhow::Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_initial_exec_command_does_not_strand_completion_wakeup() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let output = exec_command(
+        &session, &turn, "sleep 60", /*yield_time_ms*/ 250, None,
+    )
+    .await?;
+    let process_id = output.process_id.expect("background process id");
+    let manager = &session.services.unified_exec_manager;
+    let (process, initial_exec_command_active) = {
+        let store = manager.process_store.lock().await;
+        let entry = store
+            .processes
+            .get(&process_id)
+            .expect("stored background process");
+        (
+            Arc::clone(&entry.process),
+            Arc::clone(&entry.initial_exec_command_active),
+        )
+    };
+    initial_exec_command_active.store(true, std::sync::atomic::Ordering::Release);
+    let completion_wakeup = CompletionWakeRegistration::new(
+        Arc::clone(&process),
+        Arc::downgrade(&session),
+        "call".to_string(),
+        process_id,
+        "sleep 60".to_string(),
+        None,
+        TruncationPolicy::Tokens(10_000),
+    );
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .expect("stored background process")
+        .completion_wakeup = Some(completion_wakeup.clone());
+    completion_wakeup
+        .complete(/*exit_code*/ 0, Duration::from_millis(1), None)
+        .await;
+
+    let guard = crate::unified_exec::process_manager::InitialExecCommandGuard::new(
+        initial_exec_command_active,
+        Some(completion_wakeup.clone()),
+    );
+    drop(guard);
+
+    assert!(!manager.has_pending_completion_wakeup().await);
+    completion_wakeup.arm().await;
+    completion_wakeup
+        .complete(/*exit_code*/ 0, Duration::from_millis(2), None)
+        .await;
+    session.input_queue.finish_exec_wakeup_batch().await;
+    assert!(!session.input_queue.has_ready_exec_wakeups().await);
+    assert!(session.terminate_background_terminal(process_id).await);
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminating_initial_exec_command_rechecks_initial_response_state() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;
