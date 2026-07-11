@@ -264,7 +264,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
         description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
         tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
             name: "wait_agent".to_string(),
-            description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+            description: "Wait for agents to reach a final status. First finish useful non-overlapping work, then make one interruptible wait sized to the expected remaining duration instead of repeated short waits. For a delegated checker command, use its watchdog duration plus a modest reporting margin, capped by this tool's maximum timeout. The wait returns early when an agent finishes. A genuine timeout should prompt reassessment, not another reflexive short wait. Completed statuses may include the agent's final message; a later notification contains the same completed status."
                 .to_string(),
             strict: false,
             defer_loading: None,
@@ -277,7 +277,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from another pending or running agent, including queued messages and final-status notifications. Returns immediately when no other agent is pending or running. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, a no-running-agents summary, or a timeout summary if no activity arrives before the deadline."
+        description: "Wait for a mailbox update from another pending or running agent. First finish useful non-overlapping work, then make one interruptible wait sized to the expected remaining duration instead of repeated short waits. For a delegated checker command, use its watchdog duration plus a modest reporting margin, capped by this tool's maximum timeout. The wait returns early for mailbox activity, agent completion, or user interruption, and returns immediately when no other agent is pending or running. A genuine timeout should prompt reassessment, not another reflexive short wait. Does not return mailbox content; returns an activity, interruption, no-running-agents, or timeout summary."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -847,7 +847,7 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(format!(
-                "Timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+                "Timeout in milliseconds. Defaults to {}, min {}, max {}. Size one wait to the expected remaining duration; avoid repeated short waits.",
                 options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
             ))),
         ),
@@ -864,7 +864,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
     let properties = BTreeMap::from([(
         "timeout_ms".to_string(),
         JsonSchema::number(Some(format!(
-            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+            "Timeout in milliseconds. Defaults to {}, min {}, max {}. Size one wait to the expected remaining duration; avoid repeated short waits.",
             options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
         ))),
     )]);

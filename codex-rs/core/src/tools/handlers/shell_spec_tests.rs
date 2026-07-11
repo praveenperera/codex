@@ -22,12 +22,11 @@ fn exec_command_tool_matches_expected_spec() {
 
     let description = if cfg!(windows) {
         format!(
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction. For non-interactive background work, `on_exit: \"wake\"` can register a completion continuation; the command is still running when registration is reported.{}",
             windows_shell_guidance_description()
         )
     } else {
-        "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-            .to_string()
+        "Runs a command in a PTY, returning output or a session ID for ongoing interaction. For non-interactive background work, `on_exit: \"wake\"` can register a completion continuation; the command is still running when registration is reported.".to_string()
     };
 
     let mut properties = BTreeMap::from([
@@ -71,7 +70,7 @@ fn exec_command_tool_matches_expected_spec() {
             "on_exit".to_string(),
             JsonSchema::string_enum(
                 vec![json!("none"), json!("wake")],
-                Some("Action after a yielded background command exits. `wake` starts one batched continuation; defaults to `none`.".to_string()),
+                Some("Action after a yielded background command exits. `wake` requests one batched continuation; yield the turn only if the result reports `completion_notification: \"registered\"`. Registration is not completion: after it is reported, do not poll with `write_stdin`, run sleeps, or send status-only turns while waiting. The resumed continuation receives the final completion automatically. Use `none` for interactive commands, commands requiring stdin, or when no continuation is needed. Defaults to `none`.".to_string()),
             ),
         ),
         ("watchdog".to_string(), watchdog_schema()),

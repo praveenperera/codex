@@ -58,7 +58,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             "on_exit".to_string(),
             JsonSchema::string_enum(
                 vec![json!("none"), json!("wake")],
-                Some("Action after a yielded background command exits. `wake` starts one batched continuation; defaults to `none`.".to_string()),
+                Some("Action after a yielded background command exits. `wake` requests one batched continuation; yield the turn only if the result reports `completion_notification: \"registered\"`. Registration is not completion: after it is reported, do not poll with `write_stdin`, run sleeps, or send status-only turns while waiting. The resumed continuation receives the final completion automatically. Use `none` for interactive commands, commands requiring stdin, or when no continuation is needed. Defaults to `none`.".to_string()),
             ),
         ),
         (
@@ -100,12 +100,11 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         name: "exec_command".to_string(),
         description: if cfg!(windows) {
             format!(
-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+                "Runs a command in a PTY, returning output or a session ID for ongoing interaction. For non-interactive background work, `on_exit: \"wake\"` can register a completion continuation; the command is still running when registration is reported.\n\n{}",
                 windows_shell_guidance()
             )
         } else {
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-                .to_string()
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction. For non-interactive background work, `on_exit: \"wake\"` can register a completion continuation; the command is still running when registration is reported.".to_string()
         },
         strict: false,
         defer_loading: None,
@@ -124,7 +123,7 @@ fn watchdog_schema() -> JsonSchema {
             (
                 "timeout_ms".to_string(),
                 JsonSchema::number(Some(
-                    "Required positive command runtime limit in milliseconds.".to_string(),
+                    "Required positive command runtime limit in milliseconds. If reached, the final result reports `termination_reason: \"timed_out\"`; treat that as a real timeout to diagnose or reassess.".to_string(),
                 )),
             ),
             (
@@ -322,12 +321,12 @@ fn unified_exec_output_schema() -> Value {
             "completion_notification": {
                 "type": "string",
                 "enum": ["registered"],
-                "description": "Registration status for an opt-in completion wakeup."
+                "description": "Confirms registration of an opt-in completion wakeup; it does not mean the process completed."
             },
             "termination_reason": {
                 "type": "string",
                 "enum": ["timed_out"],
-                "description": "Reason the process was terminated."
+                "description": "Reason the process was terminated; `timed_out` is a final watchdog timeout."
             }
         },
         "required": ["wall_time_seconds", "output"],

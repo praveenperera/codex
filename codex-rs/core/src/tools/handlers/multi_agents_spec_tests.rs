@@ -401,13 +401,15 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     assert!(!properties.contains_key("targets"));
     assert!(properties.contains_key("timeout_ms"));
     assert!(description.contains(
-        "Does not return the content; returns either a summary of which agents have updates (if any)"
+        "The wait returns early for mailbox activity, agent completion, or user interruption"
     ));
     assert_eq!(
         properties
             .get("timeout_ms")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
+        Some(
+            "Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000. Size one wait to the expected remaining duration; avoid repeated short waits."
+        )
     );
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
