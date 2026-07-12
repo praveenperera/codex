@@ -58,7 +58,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             "on_exit".to_string(),
             JsonSchema::string_enum(
                 vec![json!("none"), json!("wake")],
-                Some("Action after a yielded background command exits. `wake` requests one batched continuation; yield the turn only if the result reports `completion_notification: \"registered\"`. Registration is not completion: after it is reported, do not poll with `write_stdin`, run sleeps, or send status-only turns while waiting. The resumed continuation receives the final completion automatically. Use `none` for interactive commands, commands requiring stdin, or when no continuation is needed. Defaults to `none`.".to_string()),
+                Some("Action after a yielded background command exits. `wake` requests one batched continuation; yield the turn only if the result reports `completion_notification: \"registered\"`. Registration is not completion: after it is reported, end the turn and do not poll with `write_stdin`, call `wait_agent`, run sleeps, or send status-only turns while waiting. The resumed continuation receives the final completion automatically. Use `none` for interactive commands, commands requiring stdin, or when no continuation is needed. Defaults to `none`.".to_string()),
             ),
         ),
         (

@@ -64,6 +64,11 @@ impl Handler {
             Some(ms) => ms,
             None => default_timeout_ms,
         };
+        if session.has_pending_exec_wakeup_delivery().await {
+            return Ok(boxed_tool_output(WaitAgentResult::from_outcome(
+                WaitOutcome::ExecWakeupReady,
+            )));
+        }
 
         let turn_state = session
             .input_queue
@@ -164,6 +169,7 @@ pub(crate) struct WaitAgentResult {
 impl WaitAgentResult {
     fn from_outcome(outcome: WaitOutcome) -> Self {
         let message = match outcome {
+            WaitOutcome::ExecWakeupReady => EXEC_WAKEUP_PENDING_WAIT_MESSAGE,
             WaitOutcome::MailboxActivity => "Wait completed.",
             WaitOutcome::Steered => "Wait interrupted by new input.",
             WaitOutcome::NoRunningAgents => "No agents are currently running.",
@@ -196,6 +202,7 @@ impl ToolOutput for WaitAgentResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitOutcome {
+    ExecWakeupReady,
     MailboxActivity,
     Steered,
     NoRunningAgents,
@@ -210,6 +217,7 @@ async fn wait_for_activity(
 ) -> WaitOutcome {
     if let Some(activity) = pending_activity {
         return match activity {
+            InputQueueActivity::ExecWakeupReady => WaitOutcome::ExecWakeupReady,
             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
             InputQueueActivity::Steer => WaitOutcome::Steered,
         };
@@ -217,6 +225,7 @@ async fn wait_for_activity(
     if !has_running_agent {
         if activity_rx.has_changed().unwrap_or(false) {
             return match *activity_rx.borrow_and_update() {
+                InputQueueActivity::ExecWakeupReady => WaitOutcome::ExecWakeupReady,
                 InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
                 InputQueueActivity::Steer => WaitOutcome::Steered,
             };
@@ -225,6 +234,7 @@ async fn wait_for_activity(
     }
     match timeout_at(deadline, activity_rx.changed()).await {
         Ok(Ok(())) => match *activity_rx.borrow_and_update() {
+            InputQueueActivity::ExecWakeupReady => WaitOutcome::ExecWakeupReady,
             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
             InputQueueActivity::Steer => WaitOutcome::Steered,
         },

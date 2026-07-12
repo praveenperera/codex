@@ -473,16 +473,21 @@ impl Session {
         sub_id: String,
     ) {
         let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
-        if !has_trigger_turn && !self.input_queue.has_ready_exec_wakeups().await {
+        let has_ready_exec_wakeup = self.input_queue.has_ready_exec_wakeups().await;
+        if !has_trigger_turn && !has_ready_exec_wakeup {
             return;
         }
         if !has_trigger_turn && self.collaboration_mode().await.mode == ModeKind::Plan {
+            self.record_exec_wakeup_event("deferred_plan");
             return;
         }
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
+                if has_ready_exec_wakeup {
+                    self.record_exec_wakeup_event("deferred_active_turn");
+                }
                 return;
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
@@ -528,6 +533,9 @@ impl Session {
                 .unified_exec_manager
                 .mark_completion_delivered(*process_id)
                 .await;
+        }
+        if !ready_exec_wakeups.is_empty() {
+            self.record_exec_wakeup_event("continuation_started");
         }
         self.start_task(turn_context, input, RegularTask::new())
             .await;

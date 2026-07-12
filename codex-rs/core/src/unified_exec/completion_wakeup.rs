@@ -4,6 +4,7 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::context::ExecCommandCompletion;
 use crate::session::session::Session;
@@ -27,6 +28,7 @@ struct CompletionWakeRegistrationInner {
     max_output_tokens: Option<usize>,
     truncation_policy: TruncationPolicy,
     delivery_pending: AtomicBool,
+    enqueued_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Default)]
@@ -56,6 +58,7 @@ impl CompletionWakeRegistration {
             max_output_tokens,
             truncation_policy,
             delivery_pending: AtomicBool::new(true),
+            enqueued_at: Mutex::new(None),
         }))
     }
 
@@ -64,11 +67,29 @@ impl CompletionWakeRegistration {
     }
 
     pub(crate) fn delivered(&self) {
-        self.0.delivery_pending.store(false, Ordering::Release);
+        if !self.clear_delivery_pending() {
+            return;
+        }
+        let enqueued_at = self
+            .0
+            .enqueued_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(session) = self.0.session.upgrade() {
+            session.record_exec_wakeup_event("delivered");
+            if let Some(enqueued_at) = enqueued_at {
+                session.record_exec_wakeup_delivery_delay(enqueued_at.elapsed());
+            }
+        }
+    }
+
+    fn clear_delivery_pending(&self) -> bool {
+        self.0.delivery_pending.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn cancel_before_arm(&self) {
-        self.delivered();
+        let _ = self.clear_delivery_pending();
         self.0
             .state
             .lock()
@@ -83,6 +104,9 @@ impl CompletionWakeRegistration {
     }
 
     pub(crate) async fn arm(&self) {
+        if let Some(session) = self.0.session.upgrade() {
+            session.record_exec_wakeup_event("armed");
+        }
         let completed = {
             let mut state = self
                 .0
@@ -124,7 +148,10 @@ impl CompletionWakeRegistration {
     }
 
     pub(crate) async fn observed(&self) {
-        self.delivered();
+        let _ = self.clear_delivery_pending();
+        if let Some(session) = self.0.session.upgrade() {
+            session.record_exec_wakeup_event("observed_directly");
+        }
         self.0
             .state
             .lock()
@@ -172,10 +199,16 @@ impl CompletionWakeRegistration {
             output.model_output(),
             termination_reason,
         );
+        *self
+            .0
+            .enqueued_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         session
             .input_queue
             .enqueue_exec_wakeup(self.0.process_id, ContextualUserFragment::into(fragment))
             .await;
+        session.record_exec_wakeup_event("enqueued");
         if self
             .0
             .state
@@ -183,6 +216,12 @@ impl CompletionWakeRegistration {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .observed
         {
+            let _ = self
+                .0
+                .enqueued_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             session
                 .input_queue
                 .remove_exec_wakeup(self.0.process_id)

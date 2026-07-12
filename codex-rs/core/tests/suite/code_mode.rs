@@ -1619,6 +1619,104 @@ text("phase 3");
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_outer_and_nested_yields_recover_exec_wakeup_once() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::CodeMode);
+        let _ = config.features.enable(Feature::UnifiedExec);
+        config.use_experimental_unified_exec_tool = true;
+    });
+    let test = builder.build(&server).await?;
+    let code = r#"// @exec: {"yield_time_ms": 250}
+const result = await tools.exec_command({
+  cmd: "sleep 1; printf wake-complete",
+  yield_time_ms: 250,
+  on_exit: "wake",
+});
+text(JSON.stringify(result));
+"#;
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-equal-yield"),
+            ev_custom_tool_call("equal-yield-exec", "exec", code),
+            ev_completed("resp-equal-yield"),
+        ]),
+    )
+    .await;
+    let yielded = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-equal-yield", "recovering registration"),
+            ev_completed("resp-equal-yield-result"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("run equal-yield nested exec").await?;
+    let first_request = yielded.single_request();
+    let first_items = custom_tool_output_items(&first_request, "equal-yield-exec");
+    let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+
+    let continuation = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-wait-for-registration"),
+                responses::ev_function_call(
+                    "wait-for-registration",
+                    "wait",
+                    &serde_json::to_string(&serde_json::json!({
+                        "cell_id": cell_id,
+                        "yield_time_ms": 1_000,
+                    }))?,
+                ),
+                ev_completed("resp-wait-for-registration"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-registration-visible", "registration visible"),
+                ev_completed("resp-registration-visible"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-completion-handled", "completion handled"),
+                ev_completed("resp-completion-handled"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.submit_turn("recover the yielded code-mode result once")
+        .await?;
+    wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::AgentMessage(message) if message.message == "completion handled" => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let requests = continuation.requests();
+    assert_eq!(requests.len(), 3);
+    let wait_items = function_tool_output_items(&requests[1], "wait-for-registration");
+    assert!(
+        wait_items.iter().any(|item| item
+            .to_string()
+            .contains("completion_notification\\\":\\\"registered")),
+        "recovered nested result should expose wake registration: {wait_items:?}"
+    );
+    assert!(
+        requests[2]
+            .body_json()
+            .to_string()
+            .contains("<exec_command_completion>")
+    );
+
+    Ok(())
+}
+
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_yield_and_termination_are_not_starved_by_runtime_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

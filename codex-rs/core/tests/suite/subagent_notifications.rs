@@ -1461,6 +1461,7 @@ async fn pending_exec_wakeup_keeps_spawned_agent_running_until_final_continuatio
     skip_if_host_windows!(Ok(()));
 
     const EXEC_CALL_ID: &str = "child-exec-wake";
+    const CHILD_WAIT_CALL_ID: &str = "child-wait-agent";
     const PREMATURE_REPORT: &str = "verification running";
     const FINAL_REPORT: &str = "verification passed";
 
@@ -1514,6 +1515,24 @@ async fn pending_exec_wakeup_keeps_spawned_agent_running_until_final_continuatio
         &server,
         |req: &wiremock::Request| {
             body_contains(req, EXEC_CALL_ID) && body_contains(req, "completion_notification")
+        },
+        sse(vec![
+            ev_response_created("resp-child-wait-agent"),
+            ev_function_call_with_namespace(
+                CHILD_WAIT_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "wait_agent",
+                "{}",
+            ),
+            ev_completed("resp-child-wait-agent"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, CHILD_WAIT_CALL_ID)
+                && body_contains(req, "exec completion wakeup is pending")
         },
         sse(vec![
             ev_response_created("resp-child-premature"),

@@ -720,6 +720,7 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 
 ### After you delegate
 - Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
+- Never call wait_agent for a command after `exec_command` reports `completion_notification: "registered"`; end the turn so its registered continuation can resume the work.
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.
 - Do not repeatedly wait by reflex.

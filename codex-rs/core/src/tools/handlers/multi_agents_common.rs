@@ -36,6 +36,7 @@ pub(crate) fn model_supports_multi_agent_backend(
     multi_agent_version != MultiAgentVersion::V2
         || model.multi_agent_version == Some(multi_agent_version)
 }
+pub(crate) const EXEC_WAKEUP_PENDING_WAIT_MESSAGE: &str = "An exec completion wakeup is pending. If completion_notification: registered is not yet visible because functions.exec yielded, recover that result once with functions.wait. Once registration is visible, end the current turn so the automatic continuation can start; do not use wait_agent for this command.";
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {

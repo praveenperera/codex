@@ -18,6 +18,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
+- The outer `exec` deadline starts before awaited nested tools. To observe a nested tool's initial result directly, set the outer `yield_time_ms` strictly longer than the nested tool's initial yield; if the outer call yields first, call `functions.wait` once with its cell ID to recover the nested result.
 - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
 

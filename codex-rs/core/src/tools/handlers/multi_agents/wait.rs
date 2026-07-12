@@ -95,6 +95,11 @@ impl Handler {
             }
             ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
         };
+        if session.has_pending_exec_wakeup_delivery().await {
+            return Err(FunctionCallError::RespondToModel(
+                EXEC_WAKEUP_PENDING_WAIT_MESSAGE.to_owned(),
+            ));
+        }
 
         session
             .emit_turn_item_started(

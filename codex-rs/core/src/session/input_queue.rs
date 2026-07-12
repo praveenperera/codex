@@ -23,6 +23,7 @@ pub(crate) enum TurnInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputQueueActivity {
+    ExecWakeupReady,
     Mailbox,
     Steer,
 }
@@ -83,9 +84,15 @@ impl InputQueue {
     pub(crate) async fn finish_exec_wakeup_batch(&self) {
         let mut wakeups = self.exec_wakeups.lock().await;
         let batching = std::mem::take(&mut wakeups.batching);
+        let became_ready = !batching.is_empty();
         wakeups.ready.extend(batching);
         self.exec_wakeup_timer_running
             .store(false, Ordering::Release);
+        drop(wakeups);
+        if became_ready {
+            self.activity_tx
+                .send_replace(InputQueueActivity::ExecWakeupReady);
+        }
     }
 
     pub(crate) async fn has_ready_exec_wakeups(&self) -> bool {
@@ -113,6 +120,8 @@ impl InputQueue {
             Some(InputQueueActivity::Steer)
         } else if self.has_pending_mailbox_items().await {
             Some(InputQueueActivity::Mailbox)
+        } else if self.has_ready_exec_wakeups().await {
+            Some(InputQueueActivity::ExecWakeupReady)
         } else {
             None
         };
@@ -315,6 +324,8 @@ mod tests {
     use super::*;
     use codex_protocol::AgentPath;
     use pretty_assertions::assert_eq;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     fn make_mail(
         author: AgentPath,
@@ -517,5 +528,56 @@ mod tests {
             VecDeque::from([(11, first), (12, second)]),
             input_queue.take_ready_exec_wakeups().await
         );
+    }
+
+    #[tokio::test]
+    async fn ready_exec_wakeup_interrupts_activity_waiters() {
+        let input_queue = InputQueue::new();
+        let (mut activity_rx, pending_activity) = input_queue.subscribe_activity(None).await;
+        assert_eq!(pending_activity, None);
+
+        input_queue
+            .enqueue_exec_wakeup(
+                7,
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: Vec::new(),
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            )
+            .await;
+        input_queue.finish_exec_wakeup_batch().await;
+
+        timeout(Duration::from_secs(1), activity_rx.changed())
+            .await
+            .expect("exec wakeup should notify activity waiter")
+            .expect("activity sender should remain open");
+        assert_eq!(
+            *activity_rx.borrow_and_update(),
+            InputQueueActivity::ExecWakeupReady
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_exec_wakeup_is_reported_to_new_subscribers() {
+        let input_queue = InputQueue::new();
+        input_queue
+            .enqueue_exec_wakeup(
+                7,
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: Vec::new(),
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            )
+            .await;
+        input_queue.finish_exec_wakeup_batch().await;
+
+        let (_, pending_activity) = input_queue.subscribe_activity(None).await;
+        assert_eq!(pending_activity, Some(InputQueueActivity::ExecWakeupReady));
     }
 }
