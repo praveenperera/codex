@@ -16,6 +16,45 @@ alias c := codex
 codex *args:
     cargo run --bin codex -- {args}
 
+# Build and atomically replace the codex executable currently resolved by PATH
+alias install := install-codex-release
+alias i := install-codex-release
+[unix]
+install-codex-release:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    cargo build --release -p codex-cli --bin codex
+
+    target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+    source="$target_dir/release/codex"
+    destination="$(command -v codex)"
+    if [[ "$destination" != /* ]]; then
+        echo "codex must resolve to an absolute path, got: $destination" >&2
+        exit 1
+    fi
+    if [[ -L "$destination" ]]; then
+        echo "refusing to replace symlinked codex executable: $destination" >&2
+        exit 1
+    fi
+    destination_dir="$(dirname "$destination")"
+    if [[ ! -f "$destination" || ! -x "$destination" || ! -w "$destination_dir" ]]; then
+        echo "codex must be a regular executable in a writable directory: $destination" >&2
+        exit 1
+    fi
+
+    staged="$(mktemp "$destination_dir/.codex.new.XXXXXX")"
+    trap 'rm -f "$staged"' EXIT
+    install -m 0755 "$source" "$staged"
+    "$staged" --version
+    if [[ -L "$destination" || ! -f "$destination" ]]; then
+        echo "codex destination changed while staging: $destination" >&2
+        exit 1
+    fi
+    mv -f "$staged" "$destination"
+    trap - EXIT
+    "$destination" --version
+
 # `codex exec`
 exec *args:
     cargo run --bin codex -- exec {args}
@@ -55,12 +94,12 @@ clippy *args:
     cargo clippy --tests {args}
 
 [unix]
-install:
+setup:
     rustup show active-toolchain
     cargo fetch
 
 [windows]
-install:
+setup:
     #!powershell.exe -File
     $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if (-not $pwsh) {
