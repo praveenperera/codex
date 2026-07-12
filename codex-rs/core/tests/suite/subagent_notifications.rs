@@ -22,6 +22,7 @@ use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_tool_search_call;
@@ -33,6 +34,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_json;
+use core_test_support::skip_if_host_windows;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
@@ -1450,6 +1452,185 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
             }],
         })])
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_exec_wakeup_keeps_spawned_agent_running_until_final_continuation() -> Result<()> {
+    skip_if_host_windows!(Ok(()));
+
+    const EXEC_CALL_ID: &str = "child-exec-wake";
+    const PREMATURE_REPORT: &str = "verification running";
+    const FINAL_REPORT: &str = "verification passed";
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-parent-spawn"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-parent-spawn"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-parent-spawn-complete"),
+            ev_assistant_message("msg-parent-spawn-complete", "parent waiting"),
+            ev_completed("resp-parent-spawn-complete"),
+        ]),
+    )
+    .await;
+
+    let exec_args = serde_json::to_string(&json!({
+        "cmd": "sleep 1; printf wake-complete",
+        "yield_time_ms": 250,
+        "on_exit": "wake",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| request_has_input_type(req, "agent_message"),
+        sse(vec![
+            ev_response_created("resp-child-exec"),
+            ev_function_call(EXEC_CALL_ID, "exec_command", &exec_args),
+            ev_completed("resp-child-exec"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, EXEC_CALL_ID) && body_contains(req, "completion_notification")
+        },
+        sse(vec![
+            ev_response_created("resp-child-premature"),
+            ev_assistant_message("msg-child-premature", PREMATURE_REPORT),
+            ev_completed("resp-child-premature"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, "<exec_command_completion>") && body_contains(req, "wake-complete")
+        },
+        sse(vec![
+            ev_response_created("resp-child-final"),
+            ev_assistant_message("msg-child-final", FINAL_REPORT),
+            ev_completed("resp-child-final"),
+        ]),
+    )
+    .await;
+
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+                && !body_contains(req, "Message Type: FINAL_ANSWER")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-wait"),
+            ev_function_call_with_namespace(
+                "wait-agent-call",
+                MULTI_AGENT_V2_NAMESPACE,
+                "wait_agent",
+                "{}",
+            ),
+            ev_completed("resp-parent-wait"),
+        ]),
+    )
+    .await;
+    let final_parent_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+                && body_contains(req, "Message Type: FINAL_ANSWER")
+                && body_contains(req, FINAL_REPORT)
+        },
+        sse(vec![
+            ev_response_created("resp-parent-final"),
+            ev_assistant_message("msg-parent-final", "done"),
+            ev_completed("resp-parent-final"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+    let _ = wait_for_spawned_thread_id(&test).await?;
+    let spawned_id = test
+        .thread_manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .find(|id| *id != test.session_configured.thread_id)
+        .expect("spawned thread id");
+    let child = test.thread_manager.get_thread(spawned_id).await?;
+    wait_for_event_match(child.as_ref(), |event| match event {
+        EventMsg::TurnComplete(event)
+            if event.last_agent_message.as_deref() == Some(PREMATURE_REPORT) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        child.agent_status().await,
+        codex_protocol::protocol::AgentStatus::Running
+    );
+
+    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
+    wait_for_event_match(child.as_ref(), |event| match event {
+        EventMsg::TurnComplete(event)
+            if event.last_agent_message.as_deref() == Some(FINAL_REPORT) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        child.agent_status().await,
+        codex_protocol::protocol::AgentStatus::Completed(Some(FINAL_REPORT.to_string()))
+    );
+
+    let request = wait_for_requests(&final_parent_request)
+        .await?
+        .pop()
+        .expect("final parent request");
+    let request_json = request.body_json().to_string();
+    assert!(request_json.contains(FINAL_REPORT));
+    assert!(!request_json.contains(PREMATURE_REPORT));
 
     Ok(())
 }

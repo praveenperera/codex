@@ -521,14 +521,16 @@ impl Session {
             }
             return;
         }
-        self.start_task(turn_context, input, RegularTask::new())
-            .await;
-        for (process_id, _) in ready_exec_wakeups {
+        // the completion input is now owned by this synthetic turn; clear delivery before
+        // starting the task so a fast continuation cannot report a stale pending completion
+        for (process_id, _) in &ready_exec_wakeups {
             self.services
                 .unified_exec_manager
-                .mark_completion_delivered(process_id)
+                .mark_completion_delivered(*process_id)
                 .await;
         }
+        self.start_task(turn_context, input, RegularTask::new())
+            .await;
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

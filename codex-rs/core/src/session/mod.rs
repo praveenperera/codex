@@ -1011,6 +1011,10 @@ fn push_prompt_fragment(
 }
 
 impl Session {
+    pub(crate) fn current_agent_status(&self) -> AgentStatus {
+        self.agent_status.borrow().clone()
+    }
+
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
         AppServerClientMetadata {
@@ -1780,6 +1784,11 @@ impl Session {
                 .await
                 .replace(error.clone());
         }
+        let defer_successful_completion = matches!(
+            &legacy_source,
+            EventMsg::TurnComplete(event) if event.error.is_none()
+        ) && turn_context.terminal_error.lock().await.is_none()
+            && self.has_pending_exec_wakeup_delivery().await;
         self.services
             .rollout_thread_trace
             .record_codex_turn_event(&turn_context.sub_id, &legacy_source);
@@ -1790,9 +1799,15 @@ impl Session {
             id: turn_context.sub_id.clone(),
             msg,
         };
-        self.send_event_raw(event).await;
-        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
-            .await;
+        self.send_event_raw_with_status_override(
+            event,
+            defer_successful_completion.then_some(AgentStatus::Running),
+        )
+        .await;
+        if !defer_successful_completion {
+            self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+                .await;
+        }
         self.maybe_mirror_event_text_to_realtime(&legacy_source)
             .await;
         self.maybe_clear_realtime_handoff_for_event(&legacy_source)
@@ -1946,7 +1961,16 @@ impl Session {
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
-        self.send_event_raw_with_persistence(event, /*persist*/ true)
+        self.send_event_raw_with_status_override(event, /*status_override*/ None)
+            .await;
+    }
+
+    async fn send_event_raw_with_status_override(
+        &self,
+        event: Event,
+        status_override: Option<AgentStatus>,
+    ) {
+        self.send_event_raw_with_persistence(event, /*persist*/ true, status_override)
             .await;
     }
 
@@ -1960,10 +1984,16 @@ impl Session {
                 true
             }
         };
-        self.send_event_raw_with_persistence(event, persist).await;
+        self.send_event_raw_with_persistence(event, persist, /*status_override*/ None)
+            .await;
     }
 
-    async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+    async fn send_event_raw_with_persistence(
+        &self,
+        event: Event,
+        persist: bool,
+        status_override: Option<AgentStatus>,
+    ) {
         // Persist the event into rollout storage; the store applies its persistence policy.
         if persist {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
@@ -1972,12 +2002,22 @@ impl Session {
         self.services
             .rollout_thread_trace
             .record_protocol_event(&event.msg);
-        self.deliver_event_raw(event).await;
+        self.deliver_event_raw_with_status_override(event, status_override)
+            .await;
     }
 
     async fn deliver_event_raw(&self, event: Event) {
+        self.deliver_event_raw_with_status_override(event, /*status_override*/ None)
+            .await;
+    }
+
+    async fn deliver_event_raw_with_status_override(
+        &self,
+        event: Event,
+        status_override: Option<AgentStatus>,
+    ) {
         // Record the last known agent status.
-        if let Some(status) = agent_status_from_event(&event.msg) {
+        if let Some(status) = status_override.or_else(|| agent_status_from_event(&event.msg)) {
             self.agent_status.send_replace(status);
         }
         if let Err(e) = self.tx_event.send(event).await {

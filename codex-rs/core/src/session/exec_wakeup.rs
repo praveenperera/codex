@@ -7,6 +7,13 @@ use super::session::Session;
 const EXEC_WAKEUP_BATCH_WINDOW: Duration = Duration::from_secs(5);
 
 impl Session {
+    pub(crate) async fn has_pending_exec_wakeup_delivery(&self) -> bool {
+        self.services
+            .unified_exec_manager
+            .has_pending_completion_wakeup()
+            .await
+    }
+
     pub(crate) fn schedule_exec_wakeup(self: &Arc<Self>) {
         if self
             .input_queue

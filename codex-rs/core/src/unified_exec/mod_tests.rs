@@ -19,6 +19,9 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -711,6 +714,22 @@ async fn pending_completion_wakeup_blocks_extension_idle_work() -> anyhow::Resul
         .get_mut(&process_id)
         .expect("stored background process")
         .completion_wakeup = Some(completion_wakeup.clone());
+
+    session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some("waiting for completion".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(AgentStatus::Running, session.current_agent_status());
 
     session.emit_thread_idle_lifecycle_if_idle().await;
     assert_eq!(0, idle_calls.load(std::sync::atomic::Ordering::SeqCst));
