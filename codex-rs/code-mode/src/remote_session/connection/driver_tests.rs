@@ -184,6 +184,7 @@ impl Drop for DriverHarness {
 #[derive(Default)]
 struct RecordingDelegate {
     closed_cells: StdMutex<Vec<CellId>>,
+    completed_cells: StdMutex<Vec<CellId>>,
     invocations: AtomicUsize,
     notifications: AtomicUsize,
 }
@@ -307,6 +308,13 @@ impl CodeModeSessionDelegate for RecordingDelegate {
         self.closed_cells
             .lock()
             .expect("closed cells lock")
+            .push(cell_id.clone());
+    }
+
+    fn cell_completed(&self, cell_id: &CellId) {
+        self.completed_cells
+            .lock()
+            .expect("completed cells lock")
             .push(cell_id.clone());
     }
 }
@@ -816,6 +824,49 @@ async fn mismatched_initial_response_fails_connection_and_closes_cell_once() {
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
+        vec![CellId::new("1".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn cell_completion_is_forwarded_after_cell_admission() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    let delegate = Arc::new(RecordingDelegate::default());
+    harness.open(session.clone(), delegate.clone()).await;
+    let _started = harness
+        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .await;
+
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::CellCompleted {
+            session_id: session.id,
+            cell_id: CellId::new("1".to_string()).into(),
+        }))
+        .await
+        .expect("cell completion");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !delegate
+                .completed_cells
+                .lock()
+                .expect("completed cells lock")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completion callback timeout");
+
+    assert_eq!(
+        *delegate
+            .completed_cells
+            .lock()
+            .expect("completed cells lock"),
         vec![CellId::new("1".to_string())]
     );
 }

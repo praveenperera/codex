@@ -1619,7 +1619,7 @@ text("phase 3");
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn equal_outer_and_nested_yields_recover_exec_wakeup_once() -> Result<()> {
+async fn yielded_code_cell_wakes_once_after_nested_exec_completes() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1629,20 +1629,24 @@ async fn equal_outer_and_nested_yields_recover_exec_wakeup_once() -> Result<()> 
         config.use_experimental_unified_exec_tool = true;
     });
     let test = builder.build(&server).await?;
-    let code = r#"// @exec: {"yield_time_ms": 250}
-const result = await tools.exec_command({
-  cmd: "sleep 1; printf wake-complete",
-  yield_time_ms: 250,
+    let gate = test.workspace_path("nested-exec-gate");
+    let code = format!(
+        r#"// @exec: {{"yield_time_ms": 50}}
+const result = await tools.exec_command({{
+  cmd: "while [ ! -f '{}' ]; do sleep 0.01; done; printf wake-complete",
+  yield_time_ms: 1_000,
   on_exit: "wake",
-});
+}});
 text(JSON.stringify(result));
-"#;
+"#,
+        gate.display()
+    );
 
     responses::mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-equal-yield"),
-            ev_custom_tool_call("equal-yield-exec", "exec", code),
+            ev_custom_tool_call("equal-yield-exec", "exec", &code),
             ev_completed("resp-equal-yield"),
         ]),
     )
@@ -1650,7 +1654,7 @@ text(JSON.stringify(result));
     let yielded = responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_assistant_message("msg-equal-yield", "recovering registration"),
+            ev_assistant_message("msg-equal-yield", "waiting for cell completion"),
             ev_completed("resp-equal-yield-result"),
         ]),
     )
@@ -1665,51 +1669,47 @@ text(JSON.stringify(result));
         &server,
         vec![
             sse(vec![
-                ev_response_created("resp-wait-for-registration"),
+                ev_response_created("resp-recover-cell"),
                 responses::ev_function_call(
-                    "wait-for-registration",
+                    "recover-cell",
                     "wait",
                     &serde_json::to_string(&serde_json::json!({
                         "cell_id": cell_id,
                         "yield_time_ms": 1_000,
                     }))?,
                 ),
-                ev_completed("resp-wait-for-registration"),
+                ev_completed("resp-recover-cell"),
             ]),
             sse(vec![
-                ev_assistant_message("msg-registration-visible", "registration visible"),
-                ev_completed("resp-registration-visible"),
-            ]),
-            sse(vec![
-                ev_assistant_message("msg-completion-handled", "completion handled"),
-                ev_completed("resp-completion-handled"),
+                ev_assistant_message("msg-cell-recovered", "cell recovered"),
+                ev_completed("resp-cell-recovered"),
             ]),
         ],
     )
     .await;
 
-    test.submit_turn("recover the yielded code-mode result once")
-        .await?;
+    fs::write(&gate, "ready")?;
     wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::AgentMessage(message) if message.message == "completion handled" => Some(()),
+        EventMsg::AgentMessage(message) if message.message == "cell recovered" => Some(()),
         _ => None,
     })
     .await;
 
     let requests = continuation.requests();
-    assert_eq!(requests.len(), 3);
-    let wait_items = function_tool_output_items(&requests[1], "wait-for-registration");
+    assert_eq!(requests.len(), 2);
     assert!(
-        wait_items.iter().any(|item| item
-            .to_string()
-            .contains("completion_notification\\\":\\\"registered")),
-        "recovered nested result should expose wake registration: {wait_items:?}"
-    );
-    assert!(
-        requests[2]
+        requests[0]
             .body_json()
             .to_string()
-            .contains("<exec_command_completion>")
+            .contains("<code_cell_completion>"),
+        "cell completion should start the recovery turn"
+    );
+    let wait_items = function_tool_output_items(&requests[1], "recover-cell");
+    assert!(
+        wait_items
+            .iter()
+            .any(|item| item.to_string().contains("wake-complete")),
+        "the automatic recovery should retrieve the existing terminal result: {wait_items:?}"
     );
 
     Ok(())

@@ -1,3 +1,4 @@
+mod completion;
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
@@ -42,6 +43,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 
+use completion::CodeCellCompletionBroker;
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
@@ -67,16 +69,19 @@ pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
+    completion_broker: Arc<CodeCellCompletionBroker>,
     shutting_down: AtomicBool,
 }
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
-        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
+        let completion_broker = Arc::new(CodeCellCompletionBroker::default());
+        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(Arc::clone(&completion_broker)));
         Self {
             session: OnceCell::new(),
             session_provider,
             dispatch_broker,
+            completion_broker,
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -129,6 +134,31 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+    }
+
+    pub(crate) fn register_cell_completion(&self, cell_id: CellId, session: &Arc<Session>) {
+        self.completion_broker
+            .register(cell_id, Arc::downgrade(session));
+    }
+
+    pub(crate) fn arm_cell_completion(&self, cell_id: &CellId) {
+        self.completion_broker.arm(cell_id);
+    }
+
+    pub(crate) fn begin_direct_observation(&self, cell_id: &CellId) {
+        self.completion_broker.begin_direct_observation(cell_id);
+    }
+
+    pub(crate) fn finish_cell_completion(&self, cell_id: &CellId) {
+        self.completion_broker.finish(cell_id);
+    }
+
+    pub(crate) fn mark_cell_completion_delivered(&self, cell_id: &CellId) {
+        self.completion_broker.mark_delivered(cell_id);
+    }
+
+    pub(crate) fn has_pending_completion_delivery(&self) -> bool {
+        self.completion_broker.has_pending_delivery()
     }
 
     pub(crate) fn start_turn_worker(

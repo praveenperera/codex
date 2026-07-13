@@ -95,6 +95,14 @@ impl Handler {
             }
             ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
         };
+        let turn_state = session
+            .input_queue
+            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+            .await;
+        let (mut activity_rx, _) = session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await;
         if session.has_pending_exec_wakeup_delivery().await {
             return Err(FunctionCallError::RespondToModel(
                 EXEC_WAKEUP_PENDING_WAIT_MESSAGE.to_owned(),
@@ -158,24 +166,34 @@ impl Handler {
             }
         }
 
-        let statuses = if !initial_final_statuses.is_empty() {
-            initial_final_statuses
+        let (statuses, exec_wakeup_ready) = if !initial_final_statuses.is_empty() {
+            (initial_final_statuses, false)
         } else {
             let mut futures = FuturesUnordered::new();
             for (id, rx) in status_rxs.into_iter() {
                 let session = session.clone();
                 futures.push(wait_for_final_status(session, id, rx));
             }
+            let exec_wakeup = session.input_queue.wait_for_exec_wakeup(&mut activity_rx);
+            tokio::pin!(exec_wakeup);
             let mut results = Vec::new();
+            let mut exec_wakeup_ready = false;
             let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
             loop {
-                match timeout_at(deadline, futures.next()).await {
-                    Ok(Some(Some(result))) => {
-                        results.push(result);
+                tokio::select! {
+                    biased;
+                    wakeup_ready = &mut exec_wakeup => {
+                        exec_wakeup_ready = wakeup_ready;
                         break;
                     }
-                    Ok(Some(None)) => continue,
-                    Ok(None) | Err(_) => break,
+                    result = timeout_at(deadline, futures.next()) => match result {
+                        Ok(Some(Some(result))) => {
+                            results.push(result);
+                            break;
+                        }
+                        Ok(Some(None)) => continue,
+                        Ok(None) | Err(_) => break,
+                    }
                 }
             }
             if !results.is_empty() {
@@ -187,7 +205,7 @@ impl Handler {
                     }
                 }
             }
-            results
+            (results, exec_wakeup_ready)
         };
 
         let timed_out = statuses.is_empty();
@@ -222,6 +240,12 @@ impl Handler {
                 }),
             )
             .await;
+
+        if exec_wakeup_ready {
+            return Err(FunctionCallError::RespondToModel(
+                EXEC_WAKEUP_PENDING_WAIT_MESSAGE.to_owned(),
+            ));
+        }
 
         Ok(boxed_tool_output(result))
     }

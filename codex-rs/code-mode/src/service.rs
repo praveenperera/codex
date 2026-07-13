@@ -298,6 +298,10 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
     fn cell_closed(&self, cell_id: &runtime::CellId) {
         self.delegate.cell_closed(&protocol_cell_id(cell_id));
     }
+
+    fn cell_completed(&self, cell_id: &runtime::CellId) {
+        self.delegate.cell_completed(&protocol_cell_id(cell_id));
+    }
 }
 
 fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use super::CellId;
@@ -26,6 +27,43 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 struct ReleasableToolDelegate {
     tool_release: Notify,
+}
+
+#[derive(Default)]
+struct CompletionDelegate {
+    completed_cells: StdMutex<Vec<CellId>>,
+}
+
+impl CodeModeSessionDelegate for CompletionDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            cancellation_token.cancelled().await;
+            Err("cancelled".to_string())
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_completed(&self, cell_id: &CellId) {
+        self.completed_cells
+            .lock()
+            .expect("completed cells lock")
+            .push(cell_id.clone());
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
 impl ReleasableToolDelegate {
@@ -119,6 +157,57 @@ async fn synchronous_exit_returns_successfully() {
             }],
             error_text: None,
         }
+    );
+}
+
+#[tokio::test]
+async fn completion_callback_fires_once_without_consuming_the_result() {
+    let delegate = Arc::new(CompletionDelegate::default());
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+
+    let response = execute(&service, execute_request(r#"text("done")"#)).await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "done".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    assert_eq!(
+        *delegate
+            .completed_cells
+            .lock()
+            .expect("completed cells lock"),
+        vec![cell_id("1")]
+    );
+}
+
+#[tokio::test]
+async fn termination_does_not_fire_completion_callback() {
+    let delegate = Arc::new(CompletionDelegate::default());
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: "await new Promise(() => {})".to_string(),
+            ..execute_request("")
+        },
+    )
+    .await;
+    assert!(matches!(response, RuntimeResponse::Yielded { .. }));
+
+    let _ = service.terminate(cell_id("1")).await.unwrap();
+
+    assert!(
+        delegate
+            .completed_cells
+            .lock()
+            .expect("completed cells lock")
+            .is_empty()
     );
 }
 

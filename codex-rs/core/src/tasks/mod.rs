@@ -473,8 +473,8 @@ impl Session {
         sub_id: String,
     ) {
         let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
-        let has_ready_exec_wakeup = self.input_queue.has_ready_exec_wakeups().await;
-        if !has_trigger_turn && !has_ready_exec_wakeup {
+        let has_ready_completion_wakeup = self.input_queue.has_ready_completion_wakeups().await;
+        if !has_trigger_turn && !has_ready_completion_wakeup {
             return;
         }
         if !has_trigger_turn && self.collaboration_mode().await.mode == ModeKind::Plan {
@@ -485,7 +485,7 @@ impl Session {
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
-                if has_ready_exec_wakeup {
+                if has_ready_completion_wakeup {
                     self.record_exec_wakeup_event("deferred_active_turn");
                 }
                 return;
@@ -512,8 +512,18 @@ impl Session {
         } else {
             Default::default()
         };
+        let ready_code_cell_wakeups = if turn_context.collaboration_mode.mode == ModeKind::Default {
+            self.input_queue.take_ready_code_cell_wakeups().await
+        } else {
+            Default::default()
+        };
         input.extend(
             ready_exec_wakeups
+                .iter()
+                .map(|(_, item)| TurnInput::ResponseItem(item.clone())),
+        );
+        input.extend(
+            ready_code_cell_wakeups
                 .iter()
                 .map(|(_, item)| TurnInput::ResponseItem(item.clone())),
         );
@@ -533,6 +543,11 @@ impl Session {
                 .unified_exec_manager
                 .mark_completion_delivered(*process_id)
                 .await;
+        }
+        for (cell_id, _) in &ready_code_cell_wakeups {
+            self.services
+                .code_mode_service
+                .mark_cell_completion_delivered(cell_id);
         }
         if !ready_exec_wakeups.is_empty() {
             self.record_exec_wakeup_event("continuation_started");

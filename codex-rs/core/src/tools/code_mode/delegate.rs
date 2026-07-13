@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::call_nested_tool;
+use super::completion::CodeCellCompletionBroker;
 use crate::session::step_context::StepContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -26,15 +27,17 @@ pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
     dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    completion_broker: Arc<CodeCellCompletionBroker>,
 }
 
 impl CodeModeDispatchBroker {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(completion_broker: Arc<CodeCellCompletionBroker>) -> Self {
         let (dispatch_tx, dispatch_rx) = async_channel::unbounded();
         Self {
             dispatch_tx,
             dispatch_rx,
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            completion_broker,
         }
     }
 
@@ -239,6 +242,10 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
 
     fn cell_closed(&self, cell_id: &CellId) {
         self.close_cell(cell_id);
+    }
+
+    fn cell_completed(&self, cell_id: &CellId) {
+        self.completion_broker.completed(cell_id);
     }
 }
 

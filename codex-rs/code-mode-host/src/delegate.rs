@@ -82,4 +82,9 @@ impl CodeModeSessionDelegate for RemoteDelegate {
         self.peer
             .close_cell(self.session_id.clone(), cell_id.clone());
     }
+
+    fn cell_completed(&self, cell_id: &CellId) {
+        self.peer
+            .complete_cell(self.session_id.clone(), cell_id.clone());
+    }
 }

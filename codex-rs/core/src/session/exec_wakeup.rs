@@ -28,6 +28,10 @@ impl Session {
             .unified_exec_manager
             .has_pending_completion_wakeup()
             .await
+            || self
+                .services
+                .code_mode_service
+                .has_pending_completion_delivery()
     }
 
     pub(crate) fn schedule_exec_wakeup(self: &Arc<Self>) {

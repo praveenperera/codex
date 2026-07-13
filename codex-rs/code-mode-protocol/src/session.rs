@@ -100,6 +100,9 @@ pub trait CodeModeSessionDelegate: Send + Sync {
         cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a>;
 
+    /// Reports that a cell committed its natural completion.
+    fn cell_completed(&self, _cell_id: &CellId) {}
+
     /// Releases delegate state associated with a cell after it reaches a terminal state.
     fn cell_closed(&self, cell_id: &CellId);
 }

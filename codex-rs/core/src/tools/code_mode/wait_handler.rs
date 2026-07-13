@@ -83,19 +83,43 @@ impl CodeModeWaitHandler {
                     exec.session
                         .services
                         .code_mode_service
-                        .terminate(cell_id)
+                        .terminate(cell_id.clone())
                         .await
                 } else {
                     exec.session
                         .services
                         .code_mode_service
                         .wait(codex_code_mode::WaitRequest {
-                            cell_id,
+                            cell_id: cell_id.clone(),
                             yield_time_ms: args.yield_time_ms,
                         })
                         .await
                 }
                 .map_err(FunctionCallError::RespondToModel)?;
+                exec.session
+                    .services
+                    .code_mode_service
+                    .begin_direct_observation(&cell_id);
+                if matches!(
+                    wait_response,
+                    codex_code_mode::WaitOutcome::LiveCell(
+                        codex_code_mode::RuntimeResponse::Yielded { .. }
+                    )
+                ) {
+                    exec.session
+                        .services
+                        .code_mode_service
+                        .register_cell_completion(cell_id.clone(), &exec.session);
+                    exec.session
+                        .services
+                        .code_mode_service
+                        .arm_cell_completion(&cell_id);
+                } else {
+                    exec.session
+                        .services
+                        .code_mode_service
+                        .finish_cell_completion(&cell_id);
+                }
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
                     && !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. })
                 {

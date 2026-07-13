@@ -53,6 +53,10 @@ impl CodeModeExecuteHandler {
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
+        exec.session
+            .services
+            .code_mode_service
+            .register_cell_completion(cell_id.clone(), &exec.session);
         let runtime_cell_id = cell_id.to_string();
         let code_cell_trace = exec
             .session
@@ -78,12 +82,21 @@ impl CodeModeExecuteHandler {
         code_cell_trace.record_initial_response(&response);
         // Yielded cells keep running, so terminal lifecycle is only emitted
         // here when the first response also ended the runtime.
-        if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+        if matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+            exec.session
+                .services
+                .code_mode_service
+                .arm_cell_completion(&cell_id);
+        } else {
             code_cell_trace.record_ended(&response);
             exec.session
                 .services
                 .code_mode_service
                 .finish_cell_dispatch(&cell_id);
+            exec.session
+                .services
+                .code_mode_service
+                .finish_cell_completion(&cell_id);
         }
         exec.session.services.elicitations.wait_until_clear().await;
         handle_runtime_response(&exec, response, args.max_output_tokens, started_at)

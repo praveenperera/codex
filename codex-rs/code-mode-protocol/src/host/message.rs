@@ -172,6 +172,11 @@ pub enum HostToClient {
         session_id: SessionId,
         cell_id: WireCellId,
     },
+    #[serde(rename = "cell/completed")]
+    CellCompleted {
+        session_id: SessionId,
+        cell_id: WireCellId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

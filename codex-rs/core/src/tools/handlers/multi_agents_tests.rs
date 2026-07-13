@@ -7,6 +7,7 @@ use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
@@ -3451,6 +3452,92 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         }
     );
     assert_eq!(success, None);
+
+    let _ = thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+}
+
+#[tokio::test]
+async fn legacy_wait_agent_is_interrupted_when_exec_wakeup_becomes_ready() {
+    let (mut session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    Arc::get_mut(&mut session)
+        .expect("test should own the only session reference")
+        .services
+        .agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start thread");
+    let agent_id = thread.thread_id;
+    let wait_task = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn = Arc::clone(&turn);
+        async move {
+            WaitAgentHandler::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [agent_id.to_string()],
+                        "timeout_ms": 10_000
+                    })),
+                ))
+                .await
+        }
+    });
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("event channel should remain open");
+            if matches!(
+                event.msg,
+                EventMsg::ItemStarted(event)
+                    if matches!(
+                        event.item,
+                        codex_protocol::items::TurnItem::CollabAgentToolCall(_)
+                    )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("wait_agent should start");
+
+    session
+        .input_queue
+        .enqueue_exec_wakeup(
+            7,
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: Vec::new(),
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        )
+        .await;
+    session.input_queue.finish_exec_wakeup_batch().await;
+
+    let Err(err) = timeout(Duration::from_secs(1), wait_task)
+        .await
+        .expect("exec wakeup should interrupt wait_agent")
+        .expect("wait task should join")
+    else {
+        panic!("interrupted wait_agent should return guidance to the model");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(EXEC_WAKEUP_PENDING_WAIT_MESSAGE.to_string())
+    );
 
     let _ = thread
         .thread

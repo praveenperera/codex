@@ -102,33 +102,35 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
                 .input_queue
                 .subscribe_activity(turn_state.as_deref())
                 .await;
-            let sleep_result: Result<bool, FunctionCallError> = if pending_activity.is_some() {
-                Ok(true)
-            } else {
-                let sleep = session
-                    .services
-                    .time_provider
-                    .sleep(session.thread_id, Duration::from_millis(args.duration_ms));
-                tokio::pin!(sleep);
-                tokio::select! {
-                    result = &mut sleep => result
-                        .map(|()| false)
-                        .map_err(|err| {
-                            FunctionCallError::Fatal(format!("failed to sleep: {err:#}"))
-                        }),
-                    result = activity_rx.changed() => {
-                        if result.is_ok() {
-                            Ok(true)
-                        } else {
-                            sleep
-                                .await
-                                .map(|()| false)
-                                .map_err(|err| {
-                                    FunctionCallError::Fatal(format!("failed to sleep: {err:#}"))
-                                })
-                        }
+            let sleep = session
+                .services
+                .time_provider
+                .sleep(session.thread_id, Duration::from_millis(args.duration_ms));
+            tokio::pin!(sleep);
+            let activity = session.input_queue.wait_for_activity(
+                turn_state.as_deref(),
+                &mut activity_rx,
+                pending_activity,
+            );
+            tokio::pin!(activity);
+            let sleep_result: Result<bool, FunctionCallError> = tokio::select! {
+                result = &mut sleep => result
+                    .map(|()| false)
+                    .map_err(|err| {
+                        FunctionCallError::Fatal(format!("failed to sleep: {err:#}"))
+                    }),
+                result = &mut activity => {
+                    if result.is_some() {
+                        Ok(true)
+                    } else {
+                        sleep
+                            .await
+                            .map(|()| false)
+                            .map_err(|err| {
+                                FunctionCallError::Fatal(format!("failed to sleep: {err:#}"))
+                            })
                     }
-                }
+                },
             };
             session.emit_turn_item_completed(turn.as_ref(), item).await;
             let interrupted = sleep_result?;

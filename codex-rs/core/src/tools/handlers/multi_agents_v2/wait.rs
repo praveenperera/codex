@@ -117,13 +117,32 @@ impl Handler {
             .await;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let outcome = wait_for_activity(
-            &mut activity_rx,
-            pending_activity,
-            has_running_agent,
-            deadline,
-        )
-        .await;
+        let outcome = if has_running_agent {
+            match timeout_at(
+                deadline,
+                session.input_queue.wait_for_activity(
+                    turn_state.as_deref(),
+                    &mut activity_rx,
+                    pending_activity,
+                ),
+            )
+            .await
+            {
+                Ok(Some(activity)) => activity.into(),
+                Ok(None) | Err(_) => WaitOutcome::TimedOut,
+            }
+        } else {
+            let activity = match pending_activity {
+                Some(activity) => Some(activity),
+                None => {
+                    session
+                        .input_queue
+                        .pending_activity(turn_state.as_deref())
+                        .await
+                }
+            };
+            activity.map_or(WaitOutcome::NoRunningAgents, Into::into)
+        };
         let result = WaitAgentResult::from_outcome(outcome);
 
         session
@@ -209,35 +228,12 @@ enum WaitOutcome {
     TimedOut,
 }
 
-async fn wait_for_activity(
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    pending_activity: Option<InputQueueActivity>,
-    has_running_agent: bool,
-    deadline: Instant,
-) -> WaitOutcome {
-    if let Some(activity) = pending_activity {
-        return match activity {
+impl From<InputQueueActivity> for WaitOutcome {
+    fn from(activity: InputQueueActivity) -> Self {
+        match activity {
             InputQueueActivity::ExecWakeupReady => WaitOutcome::ExecWakeupReady,
             InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
             InputQueueActivity::Steer => WaitOutcome::Steered,
-        };
-    }
-    if !has_running_agent {
-        if activity_rx.has_changed().unwrap_or(false) {
-            return match *activity_rx.borrow_and_update() {
-                InputQueueActivity::ExecWakeupReady => WaitOutcome::ExecWakeupReady,
-                InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-                InputQueueActivity::Steer => WaitOutcome::Steered,
-            };
         }
-        return WaitOutcome::NoRunningAgents;
-    }
-    match timeout_at(deadline, activity_rx.changed()).await {
-        Ok(Ok(())) => match *activity_rx.borrow_and_update() {
-            InputQueueActivity::ExecWakeupReady => WaitOutcome::ExecWakeupReady,
-            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-            InputQueueActivity::Steer => WaitOutcome::Steered,
-        },
-        Ok(Err(_)) | Err(_) => WaitOutcome::TimedOut,
     }
 }

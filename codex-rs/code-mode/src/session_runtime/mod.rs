@@ -285,9 +285,14 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             }
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
-        cell_state.commit_completion(event, pending_initial_yield_items, || {
+        let commit = cell_state.commit_completion(event, pending_initial_yield_items, || {
             stored_values.extend(stored_value_writes);
-        })
+        });
+        drop(stored_values);
+        if commit == CompletionCommit::Committed {
+            self.inner.delegate.cell_completed(&self.cell_id);
+        }
+        commit
     }
 
     async fn closed(&self) {

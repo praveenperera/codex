@@ -1,6 +1,7 @@
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
+use codex_code_mode::CellId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
@@ -39,6 +40,7 @@ pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
     exec_wakeups: Mutex<ExecWakeups>,
+    code_cell_wakeups: Mutex<VecDeque<(CellId, ResponseItem)>>,
     pub(crate) exec_wakeup_timer_running: AtomicBool,
 }
 
@@ -55,6 +57,7 @@ impl InputQueue {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
             exec_wakeups: Mutex::new(ExecWakeups::default()),
+            code_cell_wakeups: Mutex::new(VecDeque::new()),
             exec_wakeup_timer_running: AtomicBool::new(false),
         }
     }
@@ -103,6 +106,36 @@ impl InputQueue {
         std::mem::take(&mut self.exec_wakeups.lock().await.ready)
     }
 
+    pub(crate) async fn enqueue_code_cell_wakeup(&self, cell_id: CellId, item: ResponseItem) {
+        let mut wakeups = self.code_cell_wakeups.lock().await;
+        if wakeups.iter().any(|(queued_id, _)| queued_id == &cell_id) {
+            return;
+        }
+        wakeups.push_back((cell_id, item));
+        drop(wakeups);
+        self.activity_tx
+            .send_replace(InputQueueActivity::ExecWakeupReady);
+    }
+
+    pub(crate) async fn remove_code_cell_wakeup(&self, cell_id: &CellId) {
+        self.code_cell_wakeups
+            .lock()
+            .await
+            .retain(|(queued_id, _)| queued_id != cell_id);
+    }
+
+    pub(crate) async fn has_ready_code_cell_wakeups(&self) -> bool {
+        !self.code_cell_wakeups.lock().await.is_empty()
+    }
+
+    pub(crate) async fn take_ready_code_cell_wakeups(&self) -> VecDeque<(CellId, ResponseItem)> {
+        std::mem::take(&mut *self.code_cell_wakeups.lock().await)
+    }
+
+    pub(crate) async fn has_ready_completion_wakeups(&self) -> bool {
+        self.has_ready_exec_wakeups().await || self.has_ready_code_cell_wakeups().await
+    }
+
     pub(crate) async fn subscribe_activity(
         &self,
         turn_state: Option<&Mutex<TurnState>>,
@@ -111,21 +144,62 @@ impl InputQueue {
         Option<InputQueueActivity>,
     ) {
         let activity_rx = self.activity_tx.subscribe();
+        let pending_activity = self.pending_activity(turn_state).await;
+        (activity_rx, pending_activity)
+    }
+
+    /// Returns the highest-priority activity from authoritative queue state
+    pub(crate) async fn pending_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+    ) -> Option<InputQueueActivity> {
         let has_pending_steer = if let Some(turn_state) = turn_state {
             turn_state.lock().await.pending_input.has_user_input()
         } else {
             false
         };
-        let pending_activity = if has_pending_steer {
+        if has_pending_steer {
             Some(InputQueueActivity::Steer)
+        } else if self.has_ready_completion_wakeups().await {
+            Some(InputQueueActivity::ExecWakeupReady)
         } else if self.has_pending_mailbox_items().await {
             Some(InputQueueActivity::Mailbox)
-        } else if self.has_ready_exec_wakeups().await {
-            Some(InputQueueActivity::ExecWakeupReady)
         } else {
             None
-        };
-        (activity_rx, pending_activity)
+        }
+    }
+
+    /// Waits for activity, then derives its meaning from authoritative queue state
+    pub(crate) async fn wait_for_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+        activity_rx: &mut watch::Receiver<InputQueueActivity>,
+        pending_activity: Option<InputQueueActivity>,
+    ) -> Option<InputQueueActivity> {
+        if pending_activity.is_some() {
+            return pending_activity;
+        }
+        loop {
+            activity_rx.changed().await.ok()?;
+            if let Some(activity) = self.pending_activity(turn_state).await {
+                return Some(activity);
+            }
+        }
+    }
+
+    /// Waits until an exec completion is authoritatively ready
+    pub(crate) async fn wait_for_exec_wakeup(
+        &self,
+        activity_rx: &mut watch::Receiver<InputQueueActivity>,
+    ) -> bool {
+        loop {
+            if self.has_ready_completion_wakeups().await {
+                return true;
+            }
+            if activity_rx.changed().await.is_err() {
+                return false;
+            }
+        }
     }
 
     pub(crate) async fn enqueue_mailbox_communication(
@@ -558,6 +632,43 @@ mod tests {
             *activity_rx.borrow_and_update(),
             InputQueueActivity::ExecWakeupReady
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_activity_keeps_exec_priority_after_mailbox_signal() {
+        let input_queue = InputQueue::new();
+        let (mut activity_rx, pending_activity) = input_queue.subscribe_activity(None).await;
+        assert_eq!(pending_activity, None);
+
+        input_queue
+            .enqueue_exec_wakeup(
+                7,
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: Vec::new(),
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            )
+            .await;
+        input_queue.finish_exec_wakeup_batch().await;
+        input_queue
+            .enqueue_mailbox_communication(make_mail(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                "mailbox arrived later",
+                /*trigger_turn*/ false,
+            ))
+            .await;
+
+        let activity = timeout(
+            Duration::from_secs(1),
+            input_queue.wait_for_activity(None, &mut activity_rx, pending_activity),
+        )
+        .await
+        .expect("activity should be observed");
+        assert_eq!(activity, Some(InputQueueActivity::ExecWakeupReady));
     }
 
     #[tokio::test]

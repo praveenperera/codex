@@ -570,6 +570,17 @@ fn host_to_client_v1_variants_are_pinned() {
         json!({ "type": "delegate/cancel", "id": 11 }),
     );
     assert_wire_round_trip(
+        HostToClient::CellCompleted {
+            session_id: session_id(),
+            cell_id: cell_id("cell-1"),
+        },
+        json!({
+            "type": "cell/completed",
+            "sessionId": "session-1",
+            "cellId": "cell-1",
+        }),
+    );
+    assert_wire_round_trip(
         HostToClient::CellClosed {
             session_id: session_id(),
             cell_id: cell_id("cell-1"),

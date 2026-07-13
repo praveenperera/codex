@@ -161,6 +161,23 @@ impl SessionRegistry {
         })
     }
 
+    pub(super) fn completion_target(
+        &self,
+        session_id: &SessionId,
+        cell_id: &WireCellId,
+    ) -> Result<(Arc<dyn CodeModeSessionDelegate>, CellId), String> {
+        let session = self.records.get(session_id).ok_or_else(|| {
+            format!("code-mode host completed a cell in unknown session {session_id}")
+        })?;
+        let public_id = session.cells.get(cell_id).cloned().ok_or_else(|| {
+            format!(
+                "code-mode host completed unknown cell {} in session {session_id}",
+                cell_id.as_str()
+            )
+        })?;
+        Ok((Arc::clone(&session.delegate), public_id))
+    }
+
     pub(super) fn remove_cell(
         &mut self,
         session_id: &SessionId,

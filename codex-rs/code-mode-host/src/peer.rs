@@ -55,6 +55,7 @@ enum CellMessage {
         request: DelegateRequest,
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     },
+    Completed,
     Closed,
 }
 
@@ -257,6 +258,10 @@ impl HostPeer {
         let _ = self.route_cell_message((session_id, cell_id), CellMessage::Closed);
     }
 
+    pub(super) fn complete_cell(&self, session_id: SessionId, cell_id: CellId) {
+        let _ = self.route_cell_message((session_id, cell_id), CellMessage::Completed);
+    }
+
     pub(super) fn disconnect(&self) {
         self.disconnected.cancel();
     }
@@ -438,6 +443,12 @@ async fn drive_cell(
                 }) => {
                     peer.send_delegate_if_pending(id, key.0.clone(), request, dispatched_tx).await;
                 }
+                Some(CellMessage::Completed) => {
+                    let _ = peer.send(HostToClient::CellCompleted {
+                        session_id: key.0.clone(),
+                        cell_id: (&key.1).into(),
+                    });
+                }
                 Some(CellMessage::Closed) | None => break true,
             },
             _ = peer.disconnected.cancelled() => {
@@ -462,6 +473,12 @@ async fn drive_cell(
                         dispatched_tx,
                     }) => {
                         peer.send_delegate_if_pending(id, key.0.clone(), request, dispatched_tx).await;
+                    }
+                    Some(CellMessage::Completed) => {
+                        let _ = peer.send(HostToClient::CellCompleted {
+                            session_id: key.0.clone(),
+                            cell_id: (&key.1).into(),
+                        });
                     }
                     Some(CellMessage::Closed) | None => break,
                 },

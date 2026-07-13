@@ -76,6 +76,22 @@ impl ConnectionDriver {
                 session_id,
                 cell_id,
             } => self.close_cell(session_id, cell_id),
+            HostToClient::CellCompleted {
+                session_id,
+                cell_id,
+            } => {
+                let target = self.sessions.completion_target(&session_id, &cell_id);
+                match target {
+                    Ok((delegate, public_id)) => {
+                        delegate.cell_completed(&public_id);
+                        true
+                    }
+                    Err(err) => {
+                        self.fail(err);
+                        false
+                    }
+                }
+            }
             HostToClient::HostHello(_) | HostToClient::HandshakeRejected { .. } => {
                 self.fail("code-mode host sent a second handshake response".to_string());
                 false
