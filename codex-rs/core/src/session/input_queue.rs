@@ -397,6 +397,7 @@ impl TurnInputQueue {
 mod tests {
     use super::*;
     use codex_protocol::AgentPath;
+    use codex_protocol::ResponseItemId;
     use pretty_assertions::assert_eq;
     use tokio::time::Duration;
     use tokio::time::timeout;
@@ -580,14 +581,14 @@ mod tests {
     async fn ready_exec_wakeup_batches_preserve_identity_and_order() {
         let input_queue = InputQueue::new();
         let first = ResponseItem::Message {
-            id: Some("first".to_string()),
+            id: Some(ResponseItemId::from_server("first".to_string())),
             role: "user".to_string(),
             content: Vec::new(),
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
         let second = ResponseItem::Message {
-            id: Some("second".to_string()),
+            id: Some(ResponseItemId::from_server("second".to_string())),
             role: "user".to_string(),
             content: Vec::new(),
             phase: None,
