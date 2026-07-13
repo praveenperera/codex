@@ -2121,6 +2121,34 @@ async fn stream_error_updates_status_indicator() {
 }
 
 #[tokio::test]
+async fn capacity_retry_status_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    handle_stream_error(
+        &mut chat,
+        "Model at capacity. Retrying in 256s (attempt 9).",
+        Some("Selected model is at capacity. Please try a different model.".to_string()),
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "expected no history cell for capacity retry status"
+    );
+
+    let height = chat.desired_height(/*width*/ 80);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height))
+        .expect("create terminal");
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("draw capacity retry status");
+    assert_chatwidget_snapshot!(
+        "capacity_retry_status",
+        normalized_backend_snapshot(terminal.backend())
+    );
+}
+
+#[tokio::test]
 async fn stream_error_restores_hidden_status_indicator() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();

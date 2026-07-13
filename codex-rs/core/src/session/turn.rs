@@ -39,6 +39,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
+use crate::responses_retry::handle_server_overloaded_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -1139,6 +1140,7 @@ async fn run_sampling_request(
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
+    let mut server_overloaded_retries = 0;
     let mut initial_input = Some(input);
     let mut original_input = None;
     loop {
@@ -1187,6 +1189,21 @@ async fn run_sampling_request(
 
         if original_input.is_none() {
             original_input = Some(prompt.input);
+        }
+
+        if matches!(&err, CodexErr::ServerOverloaded)
+            && !crate::guardian::is_guardian_reviewer_source(&turn_context.session_source)
+        {
+            handle_server_overloaded_error(
+                &mut server_overloaded_retries,
+                err,
+                &sess,
+                &turn_context,
+                &cancellation_token,
+            )
+            .await?;
+            turn_context.turn_timing_state.record_sampling_retry();
+            continue;
         }
 
         if !err.is_retryable() {
